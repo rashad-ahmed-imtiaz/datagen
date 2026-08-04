@@ -1,0 +1,44 @@
+resources:
+  apps:
+    scenario_data_factory:
+      name: ${var.app_name}
+      description: Databricks-native accelerator for reproducible synthetic data with deliberate data issues.
+      source_code_path: ..
+      config:
+        command:
+          - python
+          - app/start_server.py
+        env:
+          - name: SDF_MODEL_ENDPOINT
+            value_from: model-endpoint
+          - name: SDF_GENERATION_JOB_ID
+            value_from: generation-job
+          - name: SDF_MLFLOW_EXPERIMENT_ID
+            value_from: agent-experiment
+          - name: SDF_CONTROL_VOLUME
+            value_from: control-volume
+          - name: SDF_RAW_VOLUME
+            value_from: raw-volume
+      resources:
+        - name: model-endpoint
+          serving_endpoint:
+            name: ${var.model_endpoint}
+            permission: CAN_QUERY
+        - name: generation-job
+          job:
+            id: ${resources.jobs.generate.id}
+            permission: CAN_MANAGE_RUN
+        - name: agent-experiment
+          experiment:
+            experiment_id: ${resources.experiments.agent_experiment.id}
+            permission: CAN_MANAGE
+        - name: control-volume
+          uc_securable:
+            securable_type: VOLUME
+            securable_full_name: ${var.catalog}.${var.schema}.sdf_control
+            permission: WRITE_VOLUME
+        - name: raw-volume
+          uc_securable:
+            securable_type: VOLUME
+            securable_full_name: ${var.catalog}.${var.schema}.sdf_raw
+            permission: WRITE_VOLUME

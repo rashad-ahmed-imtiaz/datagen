@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scenario Data Factory</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #0b1120;
+      color: #e5edf7;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(340px, 1fr) minmax(420px, .9fr);
+      gap: 24px;
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 24px;
+    }
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 16px; }
+    h3 { font-size: 14px; color: #9fb1c7; }
+    .sub { margin-top: 6px; color: #9fb1c7; }
+    .panel {
+      border: 1px solid #243249;
+      border-radius: 8px;
+      background: #111827;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid #243249;
+    }
+    .chat {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      min-height: 690px;
+    }
+    #messages {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow: auto;
+      padding: 16px;
+    }
+    .msg {
+      max-width: 88%;
+      border: 1px solid #2b3b55;
+      border-radius: 8px;
+      padding: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .user { align-self: flex-end; background: #0f766e; border-color: #0f766e; }
+    .agent { align-self: flex-start; background: #172033; }
+    form {
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      border-top: 1px solid #243249;
+    }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      border: 1px solid #32445f;
+      border-radius: 8px;
+      padding: 12px;
+      background: #0b1120;
+      color: #e5edf7;
+      font: inherit;
+      line-height: 1.45;
+    }
+    .actions, .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button, a.button {
+      border: 0;
+      border-radius: 6px;
+      background: #0f766e;
+      color: white;
+      padding: 10px 14px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.secondary { background: #334155; }
+    button.warn { background: #b45309; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .summary {
+      display: grid;
+      gap: 16px;
+      padding: 16px;
+      min-width: 0;
+    }
+    .summary > div {
+      min-width: 0;
+      overflow-x: auto;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      overflow: visible;
+    }
+    .metric {
+      border: 1px solid #26364f;
+      border-radius: 8px;
+      padding: 12px;
+      background: #0f172a;
+    }
+    .label {
+      color: #91a4bc;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .value {
+      margin-top: 6px;
+      font-size: 20px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 8px;
+      table-layout: auto;
+      min-width: 100%;
+    }
+    th, td {
+      border-bottom: 1px solid #243249;
+      padding: 9px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+      overflow-wrap: normal;
+      word-break: normal;
+    }
+    #tables th:first-child,
+    #tables td:first-child { width: 42%; }
+    #columns th:first-child,
+    #columns td:first-child { width: 28%; }
+    #relationships th,
+    #relationships td { width: 50%; }
+    #issues { min-width: 760px; }
+    #issues th:nth-child(1),
+    #issues td:nth-child(1) { width: 20%; }
+    #issues th:nth-child(2),
+    #issues td:nth-child(2) { width: 22%; }
+    #issues th:nth-child(3),
+    #issues td:nth-child(3) { width: 18%; }
+    #issues th:nth-child(4),
+    #issues td:nth-child(4) { width: 12%; }
+    #issues th:nth-child(5),
+    #issues td:nth-child(5) { width: 28%; }
+    #columns td:last-child,
+    #issues td:last-child {
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+    th { color: #9fb1c7; font-weight: 700; }
+    code {
+      color: #c7d2fe;
+      overflow-wrap: anywhere;
+    }
+    .status {
+      min-height: 44px;
+      padding: 12px 16px;
+      border-top: 1px solid #243249;
+      color: #b9c6d8;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .chat { min-height: 560px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Scenario Data Factory</h1>
+        <div class="sub">Agent-designed synthetic datasets with deliberate defects.</div>
+      </div>
+      <a class="button" href="/docs">API</a>
+    </header>
+
+    <section class="panel chat">
+      <div id="messages">
+        <div class="msg agent">
+          Tell me the domain, rough size, and the bad data you want injected.
+        </div>
+      </div>
+      <form id="prompt-form">
+        <textarea
+          id="prompt"
+          spellcheck="true"
+          placeholder="Example: Build 50k insurance claims with duplicate claims, 2% orphan policy ids, missing adjusters, late payments, replayed files, schema drift, and invalid customer provinces."
+        ></textarea>
+        <div class="actions">
+          <button type="submit">Draft</button>
+          <button type="button" class="secondary" id="preview" disabled>Preview</button>
+          <button type="button" class="warn" id="prepare" disabled>Prepare Run</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Active Scenario</h2>
+        <span id="scenario-id" class="label">No Draft</span>
+      </div>
+      <div class="summary">
+        <div class="metrics">
+          <div class="metric">
+            <div class="label">Domain</div>
+            <div class="value" id="domain">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Spec Hash</div>
+            <div class="value" id="hash">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Batches</div>
+            <div class="value" id="batches">-</div>
+          </div>
+        </div>
+        <div>
+          <h3>Tables</h3>
+          <table id="tables"></table>
+        </div>
+        <div>
+          <h3>Columns</h3>
+          <table id="columns"></table>
+        </div>
+        <div>
+          <h3>Relationships</h3>
+          <table id="relationships"></table>
+        </div>
+        <div>
+          <h3>Issues</h3>
+          <table id="issues"></table>
+        </div>
+        <div id="confirm-box" hidden>
+          <h3>Confirmation</h3>
+          <div class="row">
+            <input id="confirm-hash" />
+            <button id="submit" class="warn">Submit Job</button>
+          </div>
+        </div>
+      </div>
+      <div class="status" id="status">Ready.</div>
+    </section>
+  </main>
+
+  <script>
+    let activeScenario = null;
+    let preparedRun = null;
+
+    const status = document.getElementById('status');
+    const messages = document.getElementById('messages');
+    const previewButton = document.getElementById('preview');
+    const prepareButton = document.getElementById('prepare');
+    const submitButton = document.getElementById('submit');
+
+    function say(role, text) {
+      const node = document.createElement('div');
+      node.className = 'msg ' + role;
+      node.textContent = text;
+      messages.appendChild(node);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: {'content-type': 'application/json', ...(options.headers || {})}
+      });
+      const text = await response.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = {detail: text};
+      }
+      if (!response.ok) throw new Error(data.detail || data.reason || text);
+      return data;
+    }
+
+    async function action(message, fn) {
+      status.textContent = message;
+      try {
+        return await fn();
+      } catch (error) {
+        status.textContent = 'Error: ' + error.message;
+        say('agent', 'That failed: ' + error.message);
+        return null;
+      }
+    }
+
+    function renderScenario(data) {
+      activeScenario = data;
+      document.getElementById('scenario-id').textContent = data.scenario_id;
+      document.getElementById('domain').textContent = data.domain;
+      document.getElementById('hash').innerHTML =
+        '<code>' + data.spec_hash.slice(0, 12) + '...</code>';
+      document.getElementById('batches').textContent = data.timeline?.batches || '-';
+      document.getElementById('tables').innerHTML = rows(
+        ['Table', 'Rows'],
+        Object.entries(data.tables).map(([name, count]) => [name, count])
+      );
+      document.getElementById('columns').innerHTML = rows(
+        ['Table', 'Columns'],
+        Object.entries(data.columns || {}).map(([name, columns]) => [
+          name,
+          columns.map((column) => {
+            const flags = column.primary_key ? ' pk' : '';
+            return column.name + ':' + column.type + flags;
+          }).join(', ')
+        ])
+      );
+      document.getElementById('relationships').innerHTML = rows(
+        ['Parent', 'Child'],
+        (data.relationships || []).map((relationship) => [
+          relationship.parent_table + '.' + relationship.parent_column,
+          relationship.child_table + '.' + relationship.child_column
+        ])
+      );
+      document.getElementById('issues').innerHTML = rows(
+        ['Type', 'Table', 'Column', 'Count/Rate', 'Details'],
+        data.issues.map((issue) => [
+          issue.type,
+          issue.table,
+          issue.column || '-',
+          issue.display_value || displayIssueMagnitude(issue),
+          summarizeIssueDetails(issue)
+        ])
+      );
+      previewButton.disabled = false;
+      prepareButton.disabled = false;
+      status.textContent = (data.warnings || []).join('\n') || 'Draft saved.';
+    }
+
+    function rows(headers, body) {
+      const head = '<tr>' + headers.map((h) => '<th>' + h + '</th>').join('') + '</tr>';
+      const htmlRows = body.map((row) =>
+        '<tr>' + row.map((v) => '<td>' + escapeHtml(String(v)) + '</td>').join('') + '</tr>'
+      );
+      return head + htmlRows.join('');
+    }
+
+    function displayIssueMagnitude(issue) {
+      if (issue.unit === 'file' && issue.count) {
+        return issue.count === 1 ? '1 file' : issue.count + ' files';
+      }
+      return issue.exact_count ?? issue.rate ?? '-';
+    }
+
+    function summarizeIssueDetails(issue) {
+      const p = issue.parameters || {};
+      if (issue.type === 'duplicate_record') {
+        return p.duplicate_semantics || 'exact_record_duplicate';
+      }
+      if (issue.type === 'file_replay') {
+        return (p.source_batch_label || ('batch_' + String(p.source_batch).padStart(3, '0'))) +
+          ' -> ' + (p.replay_batch || ('batch_' + String(p.target_batch).padStart(3, '0'))) +
+          '; replay duplicates tracked separately';
+      }
+      if (issue.type === 'schema_drift' && p.column) {
+        return 'batch ' + (p.batch || p.activation_batch) + ': ' +
+          p.operation + ' ' + p.column.name + ':' + p.column.type;
+      }
+      if (issue.type === 'late_arrival') {
+        return (p.semantics || 'late_arrival') + '; event=' +
+          (p.event_time_column || issue.column) + '; arrival=' +
+          (p.arrival_column || issue.column);
+      }
+      if (issue.type === 'invalid_value') {
+        const invalids = p.invalid_values ? p.invalid_values.join(', ') : p.value;
+        return invalids ? 'invalid: ' + invalids : '-';
+      }
+      return Object.keys(p).length ? JSON.stringify(p) : '-';
+    }
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      })[char]);
+    }
+
+    document.getElementById('prompt-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) return;
+      say('user', prompt);
+      const data = await action('Drafting scenario...', () => {
+        return api('/api/agent/draft', {
+          method: 'POST',
+          body: JSON.stringify({prompt})
+        });
+      });
+      if (!data) return;
+      renderScenario(data);
+      say('agent', 'Drafted ' + data.name + ' with ' + data.issues.length + ' issue rules.');
+    });
+
+    previewButton.addEventListener('click', async () => {
+      const run = await action('Preparing preview...', () => {
+        return api('/api/scenarios/' + activeScenario.scenario_id + '/preview', {
+          method: 'POST',
+          body: '{}'
+        });
+      });
+      if (!run) return;
+      status.textContent = JSON.stringify(run.summary, null, 2);
+    });
+
+    prepareButton.addEventListener('click', async () => {
+      const run = await action('Preparing generation confirmation...', () => {
+        return api('/api/scenarios/' + activeScenario.scenario_id + '/generation', {
+          method: 'POST',
+          body: '{}'
+        });
+      });
+      if (!run) return;
+      preparedRun = run;
+      document.getElementById('confirm-box').hidden = false;
+      document.getElementById('confirm-hash').value = preparedRun.requires_confirmation_hash;
+      status.textContent = 'Confirm hash: ' + preparedRun.requires_confirmation_hash;
+    });
+
+    submitButton.addEventListener('click', async () => {
+      submitButton.disabled = true;
+      const data = await action('Submitting Databricks generation job...', () => {
+        return api('/api/generation/' + preparedRun.run_id + '/submit', {
+          method: 'POST',
+          body: JSON.stringify({
+            confirmation_hash: document.getElementById('confirm-hash').value.trim()
+          })
+        });
+      });
+      submitButton.disabled = false;
+      if (!data) return;
+      status.textContent = JSON.stringify(data, null, 2);
+      if (data.status === 'submitted') {
+        say('agent', 'Submitted Databricks job run ' + data.databricks_run_id + '.');
+      }
+    });
+  </script>
+</body>
+</html>

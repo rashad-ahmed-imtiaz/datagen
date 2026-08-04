@@ -1,0 +1,59 @@
+[project]
+name = "scenario-data-factory"
+version = "0.1.0"
+description = "Databricks-native accelerator for reproducible synthetic data with deliberate data issues."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Scenario Data Factory Contributors" }]
+dependencies = [
+  "databricks-sdk>=0.59.0",
+  "dbldatagen==0.4.0",
+  "faker>=26.0.0",
+  "jmespath>=1.0.1",
+  "numpy>=1.26.0,<2.0",
+  "pandas>=2.2.0",
+  "pyparsing>=3.1.0",
+  "pydantic>=2.8.0",
+  "pyyaml>=6.0.1",
+  "rich>=13.7.1",
+  "typer>=0.12.3",
+]
+
+[project.optional-dependencies]
+app = [
+  "fastapi>=0.111.0",
+  "mlflow>=3.6.0",
+  "openai-agents>=0.1.0",
+  "uvicorn>=0.30.0",
+]
+spark = [
+  "pyspark>=3.5.0",
+]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.5.0",
+]
+
+[project.scripts]
+sdf = "scenario_data_factory.cli.main:app"
+sdf_smoke_test = "scenario_data_factory.cli.job_entrypoints:smoke_test"
+sdf_preview = "scenario_data_factory.cli.job_entrypoints:preview"
+sdf_generate = "scenario_data_factory.cli.job_entrypoints:generate"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scenario_data_factory", "app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,4 @@
+resources:
+  experiments:
+    agent_experiment:
+      name: /Users/${workspace.current_user.userName}/scenario-data-factory-agent

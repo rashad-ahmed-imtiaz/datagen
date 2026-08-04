@@ -1,0 +1,39 @@
+{
+  "properties": {
+    "project_name": {
+      "type": "string",
+      "default": "scenario-data-factory",
+      "description": "Project name"
+    },
+    "catalog": {
+      "type": "string",
+      "default": "sdf",
+      "description": "Unity Catalog catalog"
+    },
+    "schema": {
+      "type": "string",
+      "default": "scenario_data_factory",
+      "description": "Unity Catalog schema"
+    },
+    "model_endpoint": {
+      "type": "string",
+      "description": "Foundation Model API or model-serving endpoint"
+    },
+    "default_locale": {
+      "type": "string",
+      "default": "en_CA"
+    },
+    "default_seed": {
+      "type": "integer",
+      "default": 42
+    },
+    "include_clean_baseline": {
+      "type": "boolean",
+      "default": true
+    },
+    "deploy_app": {
+      "type": "boolean",
+      "default": true
+    }
+  }
+}

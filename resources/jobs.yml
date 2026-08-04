@@ -1,0 +1,72 @@
+resources:
+  jobs:
+    initialize:
+      name: sdf-${bundle.target}-initialize
+      tasks:
+        - task_key: initialize
+          python_wheel_task:
+            package_name: scenario_data_factory
+            entry_point: sdf_smoke_test
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/scenario_data_factory-0.1.0-py3-none-any.whl
+              - dbldatagen==0.4.0
+    preview:
+      name: sdf-${bundle.target}-preview
+      tasks:
+        - task_key: preview
+          python_wheel_task:
+            package_name: scenario_data_factory
+            entry_point: sdf_preview
+            parameters:
+              - /Volumes/${var.catalog}/${var.schema}/sdf_control/scenarios/current.yaml
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/scenario_data_factory-0.1.0-py3-none-any.whl
+              - dbldatagen==0.4.0
+    generate:
+      name: sdf-${bundle.target}-generate
+      parameters:
+        - name: scenario_path
+          default: /Volumes/${var.catalog}/${var.schema}/sdf_control/scenarios/current.yaml
+        - name: output_root
+          default: /Volumes/${var.catalog}/${var.schema}/sdf_raw/runs
+      tasks:
+        - task_key: generate
+          python_wheel_task:
+            package_name: scenario_data_factory
+            entry_point: sdf_generate
+            parameters:
+              - "{{job.parameters.scenario_path}}"
+              - "{{job.parameters.output_root}}"
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/scenario_data_factory-0.1.0-py3-none-any.whl
+              - dbldatagen==0.4.0
+    smoke_test:
+      name: sdf-${bundle.target}-smoke-test
+      tasks:
+        - task_key: smoke_test
+          python_wheel_task:
+            package_name: scenario_data_factory
+            entry_point: sdf_smoke_test
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/scenario_data_factory-0.1.0-py3-none-any.whl
+              - dbldatagen==0.4.0

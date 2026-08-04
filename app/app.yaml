@@ -1,0 +1,14 @@
+command:
+  - python
+  - app/start_server.py
+env:
+  - name: SDF_MODEL_ENDPOINT
+    valueFrom: model-endpoint
+  - name: SDF_GENERATION_JOB_ID
+    valueFrom: generation-job
+  - name: SDF_MLFLOW_EXPERIMENT_ID
+    valueFrom: agent-experiment
+  - name: SDF_CONTROL_VOLUME
+    valueFrom: control-volume
+  - name: SDF_RAW_VOLUME
+    valueFrom: raw-volume

@@ -1,0 +1,128 @@
+scenario_id: scn_d6b11561f6b0
+name: Retail Orders Data Quality Scenario
+domain: retail_orders
+seed: 42
+locale: en_CA
+lifecycle_state: draft
+revision: 1
+timeline:
+  start_date: '2026-01-01'
+  batches: 30
+  frequency: daily
+tables:
+- name: customers
+  row_count: 100
+  columns:
+  - name: customer_id
+    type: long
+    nullable: true
+    primary_key: true
+  - name: email
+    type: string
+    nullable: true
+    primary_key: false
+    faker: email
+  - name: province
+    type: string
+    nullable: true
+    primary_key: false
+    values:
+    - 'ON'
+    - QC
+    - BC
+    - AB
+  source_systems: []
+  batch_column: batch_id
+- name: products
+  row_count: 50
+  columns:
+  - name: product_id
+    type: long
+    nullable: true
+    primary_key: true
+  - name: sku
+    type: string
+    nullable: true
+    primary_key: false
+  - name: category
+    type: string
+    nullable: true
+    primary_key: false
+    values:
+    - apparel
+    - home
+    - electronics
+  source_systems: []
+  batch_column: batch_id
+- name: orders
+  row_count: 300
+  columns:
+  - name: order_id
+    type: long
+    nullable: true
+    primary_key: true
+  - name: customer_id
+    type: long
+    nullable: false
+    primary_key: false
+  - name: order_date
+    type: date
+    nullable: true
+    primary_key: false
+  source_systems: []
+  batch_column: batch_id
+- name: order_lines
+  row_count: 900
+  columns:
+  - name: order_line_id
+    type: long
+    nullable: true
+    primary_key: true
+  - name: order_id
+    type: long
+    nullable: false
+    primary_key: false
+  - name: product_id
+    type: long
+    nullable: false
+    primary_key: false
+  - name: quantity
+    type: integer
+    nullable: true
+    primary_key: false
+    min_value: 1
+    max_value: 8
+  source_systems: []
+  batch_column: batch_id
+relationships:
+- name: customers_orders
+  parent_table: customers
+  parent_column: customer_id
+  child_table: orders
+  child_column: customer_id
+  required: true
+- name: orders_lines
+  parent_table: orders
+  parent_column: order_id
+  child_table: order_lines
+  child_column: order_id
+  required: true
+- name: products_lines
+  parent_table: products
+  parent_column: product_id
+  child_table: order_lines
+  child_column: product_id
+  required: true
+issues: []
+outputs:
+  mode: both
+  clean_delta_prefix: clean
+  dirty_delta_prefix: dirty
+  control_volume: sdf_control
+  raw_volume: sdf_raw
+  local_root: out
+  include_clean: true
+  raw_format: json
+  manifest_detail: full
+metadata:
+  synthetic_data: true

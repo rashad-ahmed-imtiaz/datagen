@@ -1,0 +1,35 @@
+bundle:
+  name: scenario-data-factory
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for Scenario Data Factory objects.
+    default: sdf
+  schema:
+    description: Unity Catalog schema for Scenario Data Factory objects.
+    default: scenario_data_factory
+  model_endpoint:
+    description: Foundation Model API or model-serving endpoint name for the App agent.
+  app_name:
+    description: Databricks App name.
+    default: scenario-data-factory
+
+artifacts:
+  wheel:
+    type: whl
+    build: uv build
+    path: .
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}

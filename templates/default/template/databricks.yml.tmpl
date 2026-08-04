@@ -1,0 +1,13 @@
+bundle:
+  name: {{.project_name}}
+
+variables:
+  catalog:
+    default: {{.catalog}}
+  schema:
+    default: {{.schema}}
+  model_endpoint:
+    default: {{.model_endpoint}}
+
+include:
+  - resources/*.yml

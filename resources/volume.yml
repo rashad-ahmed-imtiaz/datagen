@@ -1,0 +1,14 @@
+resources:
+  volumes:
+    control_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.sdf_schema.name}
+      name: sdf_control
+      volume_type: MANAGED
+      comment: Scenario Data Factory control files and saved specs.
+    raw_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.sdf_schema.name}
+      name: sdf_raw
+      volume_type: MANAGED
+      comment: Scenario Data Factory raw clean and dirty generated files.

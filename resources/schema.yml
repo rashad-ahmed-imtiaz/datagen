@@ -1,0 +1,6 @@
+resources:
+  schemas:
+    sdf_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: Scenario Data Factory metadata and generated Delta schema.

@@ -1,0 +1,519 @@
+{
+  "scenario_id": "scn_5a558c02af67",
+  "name": "Canadian Insurance Claims Reliability Scenario",
+  "domain": "insurance_claims",
+  "seed": 42,
+  "locale": "en_CA",
+  "lifecycle_state": "draft",
+  "revision": 1,
+  "timeline": {
+    "start_date": "2026-01-01",
+    "batches": 30,
+    "frequency": "daily"
+  },
+  "tables": [
+    {
+      "name": "customers",
+      "row_count": 10000,
+      "columns": [
+        {
+          "name": "customer_id",
+          "type": "long",
+          "nullable": true,
+          "primary_key": true,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "first_name",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": "first_name",
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "last_name",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": "last_name",
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "province",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": [
+            "ON",
+            "QC",
+            "BC",
+            "AB"
+          ],
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "created_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        }
+      ],
+      "source_systems": [
+        "guidewire",
+        "partner_portal",
+        "legacy_batch"
+      ],
+      "batch_column": "batch_id"
+    },
+    {
+      "name": "policies",
+      "row_count": 15000,
+      "columns": [
+        {
+          "name": "policy_id",
+          "type": "long",
+          "nullable": true,
+          "primary_key": true,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "customer_id",
+          "type": "long",
+          "nullable": false,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "policy_type",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": [
+            "auto",
+            "home",
+            "tenant"
+          ],
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "effective_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "expiry_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        }
+      ],
+      "source_systems": [
+        "guidewire",
+        "legacy_batch"
+      ],
+      "batch_column": "batch_id"
+    },
+    {
+      "name": "claims",
+      "row_count": 30000,
+      "columns": [
+        {
+          "name": "claim_id",
+          "type": "long",
+          "nullable": true,
+          "primary_key": true,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "policy_id",
+          "type": "long",
+          "nullable": false,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "source_system",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": [
+            "guidewire",
+            "partner_portal",
+            "legacy_batch"
+          ],
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "adjuster_id",
+          "type": "string",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "loss_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "settlement_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "claim_amount",
+          "type": "decimal",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": 12,
+          "scale": 2
+        }
+      ],
+      "source_systems": [
+        "guidewire",
+        "partner_portal",
+        "legacy_batch"
+      ],
+      "batch_column": "batch_id"
+    },
+    {
+      "name": "payments",
+      "row_count": 40000,
+      "columns": [
+        {
+          "name": "payment_id",
+          "type": "long",
+          "nullable": true,
+          "primary_key": true,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "claim_id",
+          "type": "long",
+          "nullable": false,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "payment_date",
+          "type": "date",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "ingestion_ts",
+          "type": "timestamp",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": null,
+          "scale": null
+        },
+        {
+          "name": "amount",
+          "type": "decimal",
+          "nullable": true,
+          "primary_key": false,
+          "faker": null,
+          "values": null,
+          "min_value": null,
+          "max_value": null,
+          "precision": 12,
+          "scale": 2
+        }
+      ],
+      "source_systems": [
+        "guidewire",
+        "legacy_batch"
+      ],
+      "batch_column": "batch_id"
+    }
+  ],
+  "relationships": [
+    {
+      "name": "customers_policies",
+      "parent_table": "customers",
+      "parent_column": "customer_id",
+      "child_table": "policies",
+      "child_column": "customer_id",
+      "required": true
+    },
+    {
+      "name": "policies_claims",
+      "parent_table": "policies",
+      "parent_column": "policy_id",
+      "child_table": "claims",
+      "child_column": "policy_id",
+      "required": true
+    },
+    {
+      "name": "claims_payments",
+      "parent_table": "claims",
+      "parent_column": "claim_id",
+      "child_table": "payments",
+      "child_column": "claim_id",
+      "required": true
+    }
+  ],
+  "issues": [
+    {
+      "issue_id": "iss_invalid_customer_provinces",
+      "type": "invalid_value",
+      "table": "customers",
+      "column": "province",
+      "rate": null,
+      "exact_count": 100,
+      "parameters": {
+        "value": "ZZ"
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_missing_customer_last_names",
+      "type": "null_value",
+      "table": "customers",
+      "column": "last_name",
+      "rate": null,
+      "exact_count": 150,
+      "parameters": {},
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_policy_effective_after_expiry",
+      "type": "date_rule_violation",
+      "table": "policies",
+      "column": "effective_date",
+      "rate": null,
+      "exact_count": 150,
+      "parameters": {
+        "after_column": "expiry_date",
+        "days_after": 1
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_duplicate_claims",
+      "type": "duplicate_record",
+      "table": "claims",
+      "column": null,
+      "rate": null,
+      "exact_count": 900,
+      "parameters": {},
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_policy_orphans",
+      "type": "referential_orphan",
+      "table": "claims",
+      "column": "policy_id",
+      "rate": null,
+      "exact_count": 300,
+      "parameters": {},
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_missing_adjusters",
+      "type": "null_value",
+      "table": "claims",
+      "column": "adjuster_id",
+      "rate": null,
+      "exact_count": 1500,
+      "parameters": {},
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_late_payments",
+      "type": "late_arrival",
+      "table": "payments",
+      "column": "ingestion_ts",
+      "rate": null,
+      "exact_count": 1600,
+      "parameters": {
+        "delay_days_min": 1,
+        "delay_days_max": 5
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_invalid_loss_dates",
+      "type": "date_rule_violation",
+      "table": "claims",
+      "column": "loss_date",
+      "rate": null,
+      "exact_count": 600,
+      "parameters": {
+        "after_column": "settlement_date"
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_file_replay_batch_10_12",
+      "type": "file_replay",
+      "table": "claims",
+      "column": null,
+      "rate": null,
+      "exact_count": 250,
+      "parameters": {
+        "source_batch": 10,
+        "target_batch": 12
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_schema_drift_fraud_score",
+      "type": "schema_drift",
+      "table": "claims",
+      "column": null,
+      "rate": null,
+      "exact_count": 1,
+      "parameters": {
+        "activation_batch": 20,
+        "add_columns": [
+          {
+            "name": "fraud_score",
+            "type": "decimal"
+          }
+        ]
+      },
+      "correlation": null
+    },
+    {
+      "issue_id": "iss_legacy_adjuster_correlation",
+      "type": "correlated_missingness",
+      "table": "claims",
+      "column": "adjuster_id",
+      "rate": null,
+      "exact_count": 600,
+      "parameters": {
+        "where": {
+          "source_system": "legacy_batch",
+          "after_batch": 15
+        }
+      },
+      "correlation": null
+    }
+  ],
+  "outputs": {
+    "mode": "both",
+    "catalog": "sdf",
+    "schema_name": "scenario_data_factory",
+    "clean_delta_prefix": "clean",
+    "dirty_delta_prefix": "dirty",
+    "control_volume": "sdf_control",
+    "raw_volume": "sdf_raw",
+    "local_root": "out",
+    "include_clean": true,
+    "raw_format": "json",
+    "manifest_detail": "full"
+  },
+  "metadata": {
+    "synthetic_data": true
+  }
+}
