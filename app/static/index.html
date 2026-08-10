@@ -342,14 +342,29 @@
           name,
           columns.map((column) => {
             const flags = column.primary_key ? ' pk' : '';
-            return column.name + ':' + column.type + flags;
+            let strategy = '';
+            if (column.faker) strategy = ' [Faker: ' + column.faker + ']';
+            else if (column.semantic?.kind === 'lookup') {
+              strategy = ' [lookup: ' + column.semantic.key_column + ']';
+            } else if (column.semantic?.kind === 'date_offset') {
+              strategy = ' [after: ' + column.semantic.base_column + ']';
+            } else if (column.semantic?.kind === 'log_normal') {
+              strategy = ' [log-normal median: ' + column.semantic.median + ']';
+            } else if (Array.isArray(column.values)) {
+              const preview = column.values.slice(0, 4).join(', ');
+              const weighted = Array.isArray(column.weights) ? '; weighted' : '';
+              strategy = ' [values: ' + preview + (column.values.length > 4 ? ', ...' : '') + weighted + ']';
+            }
+            return column.name + ':' + column.type + flags + strategy;
           }).join(', ')
         ])
       );
       document.getElementById('relationships').innerHTML = rows(
         ['Parent', 'Child'],
         (data.relationships || []).map((relationship) => [
-          relationship.parent_table + '.' + relationship.parent_column,
+          relationship.parent_table + '.' + relationship.parent_column +
+            (relationship.parent_filter ? ' [' + relationship.parent_filter.column +
+              ' in ' + relationship.parent_filter.values.join(', ') + ']' : ''),
           relationship.child_table + '.' + relationship.child_column
         ])
       );

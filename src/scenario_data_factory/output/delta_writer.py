@@ -15,7 +15,7 @@ def write_delta_tables(
     written: list[str] = []
     table_prefix = _safe_identifier(prefix)
     if namespace:
-        table_prefix = f"{table_prefix}_{_safe_identifier(namespace)}"
+        table_prefix = f"{_safe_identifier(namespace)}_{table_prefix}"
     for table, df in dataframes.items():
         full_name = f"`{catalog}`.`{schema}`.`{table_prefix}_{_safe_identifier(table)}`"
         df.write.format("delta").mode("overwrite").option(

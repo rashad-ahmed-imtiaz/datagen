@@ -44,7 +44,10 @@ async def health() -> dict[str, str]:
 
 @app.post("/api/agent/draft")
 async def create_scenario_from_prompt(request: PromptDraftRequest) -> dict[str, object]:
-    return service.create_scenario_from_prompt(request.prompt)
+    try:
+        return service.create_scenario_from_prompt(request.prompt)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/scenarios")

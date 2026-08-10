@@ -50,7 +50,7 @@ def run_generation(
             spec.outputs.catalog,
             spec.outputs.schema_name,
             spec.outputs.dirty_delta_prefix,
-            namespace=spec.scenario_id,
+            namespace=spec.name,
         )
         if spec.outputs.include_clean:
             written["clean_delta_tables"] = write_delta_tables(
@@ -58,7 +58,7 @@ def run_generation(
                 spec.outputs.catalog,
                 spec.outputs.schema_name,
                 spec.outputs.clean_delta_prefix,
-                namespace=spec.scenario_id,
+                namespace=spec.name,
             )
     if spec.outputs.mode in {OutputMode.RAW, OutputMode.BOTH, "raw", "both"}:
         raw_dirty = apply_physical_raw_issues(dirty, spec, plan)

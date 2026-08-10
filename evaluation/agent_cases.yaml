@@ -11,6 +11,21 @@ cases:
     prompt: Create a small retail orders scenario.
     expected_domain: retail_orders
     required_issues: []
+  - id: retail_sales_guardrails_custom_schema
+    prompt: >
+      Generate 500,000 records for a retail sales scenario. Business rules:
+      Sales only occur in North-East US states. Order volume per state is proportional
+      to 2020 Census population. ship_date must be on or after order_date. Returns
+      only exist for delivered orders. Tables: customers(customer_id,state,city,segment),
+      orders(order_id,customer_id,order_date,ship_date,amount,channel), returns(return_id,
+      order_id,reason,refund_amount). Relationships: one customer to many orders to
+      some returns. Data issues: duplicate_record on orders 1%, referential_orphan
+      on customer_id 2%, date_rule_violation ship before order 0.5%, null_value on
+      returns.reason 3%. Settings: seed 42, timeline 2025-01-01 across 12 monthly
+      batches, locale en-US, output Delta + raw.
+    expected_domain: custom_schema
+    required_tables: [customers, orders, returns]
+    required_issues: [duplicate_record, referential_orphan, date_rule_violation, null_value]
   - id: custom_schema
     prompt: Validate a custom schema with customers and orders.
     expected_domain: custom_schema

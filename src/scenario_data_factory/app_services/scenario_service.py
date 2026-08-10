@@ -170,6 +170,7 @@ def _summary(spec: ScenarioSpec, warnings: list[str]) -> dict[str, object]:
         "name": spec.name,
         "domain": spec.domain,
         "timeline": spec.timeline.model_dump(mode="json"),
+        "metadata": spec.metadata,
         "tables": {table.name: table.row_count for table in spec.tables},
         "columns": {
             table.name: [
@@ -178,6 +179,10 @@ def _summary(spec: ScenarioSpec, warnings: list[str]) -> dict[str, object]:
                     "type": column.type,
                     "primary_key": column.primary_key,
                     "nullable": column.nullable,
+                    "faker": column.faker,
+                    "values": column.values,
+                    "weights": column.weights,
+                    "semantic": column.semantic,
                 }
                 for column in table.columns
             ]
@@ -190,6 +195,7 @@ def _summary(spec: ScenarioSpec, warnings: list[str]) -> dict[str, object]:
                 "parent_column": relationship.parent_column,
                 "child_table": relationship.child_table,
                 "child_column": relationship.child_column,
+                "parent_filter": relationship.parent_filter,
             }
             for relationship in spec.relationships
         ],
@@ -240,67 +246,65 @@ def _issue_display_value(issue: IssueSpec) -> str:
 
 
 def _spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
-    if _blueprint_domain_from_prompt(prompt.lower()) is None:
-        spec, assumptions = _custom_spec_from_agent_or_fallback(prompt)
-        return spec, assumptions
-
-    intent, intent_note = _agent_intent_from_model(prompt)
-    if intent:
-        try:
-            spec, assumptions = _spec_from_intent(intent, prompt)
-            return spec, [intent_note, *assumptions]
-        except Exception as exc:
-            fallback_note = (
-                "Agent intent extraction was invalid; used deterministic fallback: "
-                f"{exc}"
-            )
-    else:
-        fallback_note = intent_note
-    spec, assumptions = _heuristic_spec_from_prompt(prompt)
-    return spec, [fallback_note, *assumptions]
+    # Natural-language requests are model-designed. Blueprints remain available only
+    # to the explicit YAML/JSON and legacy API paths; they are never selected here.
+    return _custom_spec_from_agent_or_fallback(prompt)
 
 
 def _custom_spec_from_agent_or_fallback(prompt: str) -> tuple[ScenarioSpec, list[str]]:
-    normalized = prompt.lower()
-    if _looks_like_ai_model_ops(normalized):
-        text = prompt.strip()
-        seed = _extract_seed(normalized)
-        table_counts = _extract_table_count_mentions(normalized)
-        spec = _ai_model_ops_custom_spec(text, table_counts, seed)
-        spec = _ensure_databricks_outputs(spec)
-        spec = _apply_custom_prompt_issues(spec, normalized)
-        return spec, [
-            "Recognized AI model operations domain; used deterministic domain planner.",
-            (
-                "Preserved named AI platform tables, relationships, row counts, and "
-                "issue targets before validation."
-            ),
-            *_custom_issue_assumptions(normalized, spec),
-            "Generation still requires hash confirmation before the Databricks job is submitted.",
-        ]
-
-    intent = _custom_schema_intent_from_model(prompt)
+    intent: dict[str, Any] | None = None
+    for _ in range(3):
+        candidate = _custom_schema_intent_from_model(prompt)
+        if candidate and isinstance(candidate.get("table_specs"), list):
+            intent = candidate
+            break
     if intent and isinstance(intent.get("table_specs"), list):
         try:
             spec, assumptions = _custom_spec_from_intent(intent, prompt)
-            return spec, ["Schema-design agent created the custom ScenarioSpec.", *assumptions]
+            return spec, ["Schema-design agent designed the custom ScenarioSpec.", *assumptions]
         except Exception as exc:
-            repaired = _repair_custom_schema_intent_with_model(prompt, intent, str(exc))
-            if repaired and isinstance(repaired.get("table_specs"), list):
+            current_intent = intent
+            current_error = str(exc)
+            enriched = _enrich_column_strategies_with_model(prompt, current_intent, current_error)
+            if enriched:
+                current_intent = _merge_model_column_strategies(current_intent, enriched)
+                try:
+                    spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
+                    return spec, [
+                        "Schema-design agent completed its field-generation contract.",
+                        *assumptions,
+                    ]
+                except Exception as enrichment_exc:
+                    current_error = str(enrichment_exc)
+            for attempt in range(1, 4):
+                repaired = _repair_custom_schema_intent_with_model(
+                    prompt, current_intent, current_error
+                )
+                if not repaired or not isinstance(repaired.get("table_specs"), list):
+                    fallback_note = f"Schema-design agent output was invalid: {current_error}"
+                    break
+                repaired = _normalize_repaired_intent(repaired, current_intent)
                 try:
                     spec, assumptions = _custom_spec_from_intent(repaired, prompt)
                     return spec, [
-                        "Schema-design agent returned an invalid draft; repair agent fixed it.",
+                        f"Schema-design agent repaired its draft on attempt {attempt}.",
                         *assumptions,
                     ]
-                except Exception:
-                    pass
-            fallback_note = f"Schema-design agent output was invalid: {exc}"
+                except Exception as repair_exc:
+                    current_intent = repaired
+                    current_error = str(repair_exc)
+            else:
+                fallback_note = (
+                    "Schema-design repair agent returned three invalid drafts: "
+                    f"{current_error}"
+                )
     else:
         fallback_note = "Schema-design agent did not return usable table_specs."
 
-    spec, assumptions = _heuristic_custom_spec_from_prompt(prompt)
-    return spec, [fallback_note, *assumptions]
+    raise ValueError(
+        f"{fallback_note} Repair did not produce a valid ScenarioSpec; no deterministic "
+        "fallback was used."
+    )
 
 
 def _heuristic_spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
@@ -365,7 +369,7 @@ def _spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[ScenarioSpec
     else:
         spec, table_plan_note = _complete_table_counts_with_model(spec, explicit_counts, prompt)
     data = spec.model_dump(mode="json")
-    parsed_issues = _issues_from_intent(intent.get("issues"), spec)
+    parsed_issues = _issues_from_intent(intent.get("issues"), spec, prompt)
     if parsed_issues:
         data["issues"] = [issue.model_dump(mode="json") for issue in parsed_issues]
     else:
@@ -384,6 +388,7 @@ def _spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[ScenarioSpec
 def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[ScenarioSpec, list[str]]:
     name = str(intent.get("name") or _extract_name(prompt, "custom_schema"))
     seed = int(intent.get("seed") or 42)
+    timeline = _timeline_from_intent(intent)
     tables = _unique_table_specs_from_intent(intent["table_specs"])
     if not tables:
         raise ValueError("custom schema must contain at least one valid table")
@@ -391,7 +396,7 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
     relationships: list[RelationshipSpec] = []
     for relationship in intent.get("relationships", []):
         if not isinstance(relationship, dict):
-            continue
+            raise ValueError("relationship entries must be objects")
         try:
             parsed = RelationshipSpec.model_validate(
                 {
@@ -403,54 +408,59 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
                     "child_column": _identifier(relationship.get("child_column"), "child_id"),
                 }
             )
-        except Exception:
-            continue
+        except Exception as exc:
+            raise ValueError(f"relationship could not be parsed: {relationship}") from exc
         if parsed.parent_table not in table_map or parsed.child_table not in table_map:
-            continue
+            raise ValueError(
+                f"relationship {parsed.name} references missing table "
+                f"{parsed.parent_table} or {parsed.child_table}"
+            )
         if parsed.parent_column not in table_map[parsed.parent_table].column_names():
-            continue
+            raise ValueError(
+                f"relationship {parsed.name} references missing parent column "
+                f"{parsed.parent_table}.{parsed.parent_column}"
+            )
         if parsed.child_column not in table_map[parsed.child_table].column_names():
-            continue
+            raise ValueError(
+                f"relationship {parsed.name} references missing child column "
+                f"{parsed.child_table}.{parsed.child_column}"
+            )
         relationships.append(parsed)
     spec = ScenarioSpec(
         name=name,
         domain="custom_schema",
         seed=seed,
         locale=str(intent.get("locale") or "en_CA"),
-        timeline=TimelineSpec(start_date=date(2026, 1, 1), batches=30),
+        timeline=timeline,
         tables=tables,
         relationships=relationships,
+        metadata=_metadata_from_intent(intent),
     )
     spec = _ensure_databricks_outputs(spec)
     data = spec.model_dump(mode="json")
-    data["issues"] = []
-    base_spec = _ensure_requested_relationship_columns(
-        ScenarioSpec.model_validate(data), prompt.lower()
-    )
-    base_spec = _ensure_requested_operational_columns(base_spec, prompt.lower())
-    data = base_spec.model_dump(mode="json")
-    prompt_issue_spec = (
-        _apply_custom_prompt_issues(base_spec, prompt.lower())
-        if _mentions_any_issue(prompt.lower())
-        else base_spec
-    )
-    if prompt_issue_spec.issues:
-        data["issues"] = [issue.model_dump(mode="json") for issue in prompt_issue_spec.issues]
-    else:
-        data["issues"] = [
-            issue.model_dump(mode="json")
-            for issue in _issues_from_intent(intent.get("issues"), base_spec)
-        ]
+    base_spec = ScenarioSpec.model_validate(data)
+    parsed_issues = _issues_from_intent(intent.get("issues"), base_spec, prompt)
+    _ensure_agent_issue_parse_complete(intent.get("issues"), parsed_issues)
+    data["issues"] = [
+        issue.model_dump(mode="json")
+        for issue in parsed_issues
+    ]
     spec = ScenarioSpec.model_validate(data)
-    semantic_gaps = _custom_semantic_gaps(spec, prompt)
+    semantic_gaps = [
+        *_custom_semantic_gaps(spec, prompt),
+        *_semantic_value_generation_gaps(spec),
+        *_execution_rule_gaps(spec, prompt),
+        *_custom_issue_gaps(spec, prompt),
+        *_issue_parameter_reference_gaps(spec),
+    ]
     if semantic_gaps:
-        raise ValueError(f"custom schema missed requested concepts: {', '.join(semantic_gaps)}")
+        raise ValueError(f"custom ScenarioSpec missed requested intent: {', '.join(semantic_gaps)}")
     spec = _ensure_timeline_supports_issue_batches(spec)
     return spec, [
         "Agent created a custom schema because the request was not limited to a known blueprint.",
         (
-            "Custom tables, relationships, row counts, and issue rules were "
-            "validated deterministically."
+            "Agent-provided tables, relationships, row counts, issue rules, and guardrails "
+            "were normalized and validated."
         ),
         *_custom_issue_assumptions(prompt.lower(), spec),
         "Generation still requires hash confirmation before the Databricks job is submitted.",
@@ -478,6 +488,8 @@ def _table_spec_from_intent(raw_table: dict[str, Any]) -> TableSpec:
                 primary_key=is_primary_key,
                 faker=column.get("faker"),
                 values=column.get("values"),
+                weights=_column_weights_from_intent(column),
+                semantic=_column_semantic_from_intent(column),
                 min_value=column.get("min_value"),
                 max_value=column.get("max_value"),
                 precision=column.get("precision"),
@@ -498,10 +510,74 @@ def _table_spec_from_intent(raw_table: dict[str, Any]) -> TableSpec:
         columns[0] = columns[0].model_copy(update={"primary_key": True, "nullable": False})
     return TableSpec(
         name=_identifier(raw_table.get("name"), "table"),
-        row_count=max(1, int(raw_table.get("row_count") or 1000)),
+        row_count=max(1, int(raw_table.get("row_count") or raw_table.get("record_count") or 1000)),
         columns=columns,
         source_systems=list(raw_table.get("source_systems") or []),
     )
+
+
+def _column_semantic_from_intent(column: dict[str, Any]) -> dict[str, Any] | None:
+    semantic = column.get("semantic")
+    if isinstance(semantic, dict):
+        if semantic.get("kind") == "date":
+            return {**semantic, "kind": "timeline"}
+        return semantic
+    distribution = column.get("distribution")
+    if isinstance(distribution, dict) and distribution.get("type") == "log_normal":
+        return {
+            "kind": "log_normal",
+            "median": distribution.get("median"),
+            "sigma": distribution.get("sigma", 1.0),
+            "max": distribution.get("max"),
+        }
+    return None
+
+
+def _column_weights_from_intent(column: dict[str, Any]) -> object:
+    weights = column.get("weights")
+    if weights is not None:
+        values = column.get("values")
+        if isinstance(values, list) and isinstance(weights, list) and len(values) == len(weights):
+            return weights
+        return None
+    values = column.get("values")
+    distribution = column.get("distribution")
+    if not isinstance(values, list) or not isinstance(distribution, dict) or "type" in distribution:
+        return None
+    return [distribution.get(value) for value in values]
+
+
+def _normalize_repaired_intent(
+    repaired: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalize harmless model-format aliases without inventing scenario content."""
+    normalized = dict(repaired)
+    tables = normalized.get("table_specs")
+    if isinstance(tables, list):
+        for table in tables:
+            if isinstance(table, dict) and not table.get("row_count") and table.get("record_count"):
+                table["row_count"] = table["record_count"]
+    relationships = normalized.get("relationships")
+    if isinstance(relationships, list):
+        for index, relationship in enumerate(relationships, start=1):
+            if isinstance(relationship, dict) and not relationship.get("name"):
+                relationship["name"] = (
+                    f"{relationship.get('parent_table', 'parent')}_"
+                    f"{relationship.get('child_table', 'child')}_{index}"
+                )
+    issues = normalized.get("issues")
+    executable = isinstance(issues, list) and all(
+        isinstance(issue, dict)
+        and (
+            issue.get("rate") is not None
+            or issue.get("exact_count") is not None
+            or (issue.get("parameters") or {}).get("file_count") is not None
+        )
+        for issue in issues
+    )
+    if not executable and isinstance(previous.get("issues"), list):
+        normalized["issues"] = previous["issues"]
+    return normalized
 
 
 def _unique_table_specs_from_intent(raw_tables: object) -> list[TableSpec]:
@@ -519,6 +595,43 @@ def _unique_table_specs_from_intent(raw_tables: object) -> list[TableSpec]:
         seen_tables.add(table.name)
         tables.append(table)
     return tables
+
+
+def _timeline_from_intent(intent: dict[str, Any]) -> TimelineSpec:
+    raw_timeline = intent.get("timeline")
+    if isinstance(raw_timeline, dict):
+        start_value = str(raw_timeline.get("start_date") or "2026-01-01")
+        try:
+            start = date.fromisoformat(start_value)
+        except ValueError:
+            start = date(2026, 1, 1)
+        frequency = str(raw_timeline.get("frequency") or "daily").lower()
+        if frequency not in {"daily", "monthly"}:
+            frequency = "daily"
+        return TimelineSpec(
+            start_date=start,
+            batches=max(1, int(raw_timeline.get("batches") or 30)),
+            frequency=frequency,  # type: ignore[arg-type]
+        )
+    return TimelineSpec(start_date=date(2026, 1, 1), batches=30)
+
+
+def _metadata_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
+    metadata = {"synthetic_data": True}
+    raw_metadata = intent.get("metadata")
+    if isinstance(raw_metadata, dict):
+        metadata.update(raw_metadata)
+    for key in (
+        "business_rules",
+        "statistical_anchors",
+        "distribution_rules",
+        "seasonality",
+        "guardrails",
+    ):
+        value = intent.get(key)
+        if value:
+            metadata[key] = value
+    return metadata
 
 
 def _ensure_requested_relationship_columns(spec: ScenarioSpec, text: str) -> ScenarioSpec:
@@ -631,9 +744,9 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
         "promotion": ("promotion",),
         "coupon redemption": ("coupon redemption", "redemption"),
         "coupon": ("coupon",),
-        "store": ("store",),
         "product": ("product",),
         "customer": ("customer",),
+        "return": ("returns", "return"),
         "postal code": ("postal code", "postal"),
     }
     gaps: list[str] = []
@@ -647,10 +760,240 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
             )
             if not has_concept:
                 gaps.append(concept)
+    if _explicit_table_section(text):
+        mentioned_table_names = {
+            table.name
+            for table in spec.tables
+            if table.name in text or table.name.replace("_", " ") in text
+        }
+        if mentioned_table_names and len(spec.tables) >= len(mentioned_table_names):
+            return gaps
     if mentioned_concepts >= 3 and len(spec.tables) < 4:
         gaps.append("multi-entity relational design")
     if "event" in text and not any("event" in table.name for table in spec.tables):
         gaps.append("event fact table")
+    return gaps
+
+
+_SUPPORTED_FAKER_PROVIDERS = {
+    "address",
+    "ascii_email",
+    "city",
+    "company",
+    "country",
+    "date_time",
+    "domain_name",
+    "email",
+    "first_name",
+    "iban",
+    "job",
+    "last_name",
+    "name",
+    "paragraph",
+    "postcode",
+    "sentence",
+    "state",
+    "state_abbr",
+    "street_address",
+    "text",
+    "url",
+    "user_name",
+    "uuid4",
+}
+
+
+def _semantic_value_generation_gaps(spec: ScenarioSpec) -> list[str]:
+    """Reject plans that would fall through to generic compiler defaults."""
+    gaps: list[str] = []
+    placeholder = re.compile(r"^(?:city|name|place|value|text|record|item|category)_?\d+$", re.I)
+    foreign_keys = {
+        (relationship.child_table, relationship.child_column)
+        for relationship in spec.relationships
+    }
+    for table in spec.tables:
+        columns = table.column_names()
+        for column in table.columns:
+            if column.primary_key or (table.name, column.name) in foreign_keys:
+                continue
+            semantic = column.semantic or {}
+            if column.type == ColumnType.STRING:
+                if column.faker:
+                    if column.faker not in _SUPPORTED_FAKER_PROVIDERS:
+                        gaps.append(
+                            f"{table.name}.{column.name} uses unsupported Faker provider "
+                            f"{column.faker}"
+                        )
+                    continue
+                if column.values:
+                    if any(
+                        isinstance(value, str) and placeholder.fullmatch(value.strip())
+                        for value in column.values
+                    ):
+                        gaps.append(f"{table.name}.{column.name} contains placeholder labels")
+                    continue
+                if semantic.get("kind") != "lookup":
+                    gaps.append(
+                        f"{table.name}.{column.name} needs values, a Faker provider, "
+                        "or a semantic lookup"
+                    )
+                    continue
+                key_column = semantic.get("key_column")
+                values_by_key = semantic.get("values_by_key")
+                if (
+                    key_column not in columns
+                    or not isinstance(values_by_key, dict)
+                    or not values_by_key
+                ):
+                    gaps.append(f"{table.name}.{column.name} has an invalid semantic lookup")
+                    continue
+                if any(
+                    not isinstance(values, list)
+                    or not values
+                    or any(not isinstance(value, str) or not value.strip() for value in values)
+                    for values in values_by_key.values()
+                ):
+                    gaps.append(f"{table.name}.{column.name} lookup has no usable real values")
+                continue
+            if column.type in {ColumnType.DATE, ColumnType.TIMESTAMP}:
+                if semantic.get("kind") not in {"timeline", "date_offset"}:
+                    gaps.append(
+                        f"{table.name}.{column.name} needs a timeline or date-offset rule"
+                    )
+                continue
+            if column.type == ColumnType.DECIMAL:
+                if semantic.get("kind") not in {"log_normal", "uniform_range", "normal"}:
+                    gaps.append(
+                        f"{table.name}.{column.name} needs a numeric distribution rule"
+                    )
+                continue
+            if column.type in {ColumnType.INTEGER, ColumnType.LONG}:
+                if not semantic and column.min_value is None and column.max_value is None:
+                    gaps.append(
+                        f"{table.name}.{column.name} needs a numeric range or semantic rule"
+                    )
+                continue
+            if column.type == ColumnType.BOOLEAN and not semantic and not column.values:
+                gaps.append(
+                    f"{table.name}.{column.name} needs a boolean value strategy"
+                )
+    return gaps
+
+
+def _execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
+    """Ensure material guardrails are executable by the generated data, not just documented."""
+    text = prompt.lower()
+    gaps: list[str] = []
+
+    def column(table_name: str, column_name: str) -> ColumnSpec | None:
+        table = next((item for item in spec.tables if item.name == table_name), None)
+        if table is None:
+            return None
+        return next((item for item in table.columns if item.name == column_name), None)
+
+    if "population" in text and "state" in text:
+        state = column("customers", "state")
+        if state is None or not state.values or not state.weights:
+            gaps.append("population-weighted customers.state values")
+    if "65%" in text and "35%" in text and "channel" in text:
+        channel = column("orders", "channel")
+        if channel is None or not channel.values or not channel.weights:
+            gaps.append("weighted orders.channel values")
+    if "log-normal" in text or "log normal" in text:
+        amount = column("orders", "amount")
+        if amount is None or (amount.semantic or {}).get("kind") != "log_normal":
+            gaps.append("log-normal orders.amount rule")
+    if "ship_date must be on or after" in text:
+        ship_date = column("orders", "ship_date")
+        semantic = ship_date.semantic if ship_date else {}
+        if (
+            not isinstance(semantic, dict)
+            or semantic.get("kind") != "date_offset"
+            or semantic.get("base_column") != "order_date"
+            or semantic.get("min_days", 0) < 0
+        ):
+            gaps.append("non-negative orders.ship_date offset from order_date")
+    if "returns only exist for delivered orders" in text:
+        relation = next(
+            (
+                item
+                for item in spec.relationships
+                if item.parent_table == "orders" and item.child_table == "returns"
+            ),
+            None,
+        )
+        parent_filter = relation.parent_filter if relation else None
+        if not parent_filter or "delivered" not in parent_filter.get("values", []):
+            gaps.append("orders-to-returns delivered-order relationship filter")
+    return gaps
+
+
+def _custom_issue_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
+    text = prompt.lower()
+    issue_types = {IssueType(issue.type) for issue in spec.issues}
+    required: dict[IssueType, tuple[str, ...]] = {
+        IssueType.DUPLICATE_RECORD: ("duplicate", "duplicated"),
+        IssueType.REFERENTIAL_ORPHAN: ("orphan", "referential"),
+        IssueType.NULL_VALUE: ("missing", "null"),
+        IssueType.DATE_RULE_VIOLATION: (
+            "date_rule_violation",
+            "ship before order",
+            "before inference",
+            "mismatched timestamp",
+            "mismatched timestamps",
+        ),
+        IssueType.LATE_ARRIVAL: ("late-arriving", "late arriving", "late_arrival"),
+        IssueType.FILE_REPLAY: ("replayed", "replay", "file_replay"),
+        IssueType.SCHEMA_DRIFT: ("schema drift", "renamed columns", "inconsistent data types"),
+        IssueType.INVALID_VALUE: ("invalid", "impossible"),
+        IssueType.INVALID_FORMAT: ("malformed", "invalid format"),
+        IssueType.BLANK_VALUE: ("empty prompt", "blank"),
+    }
+    gaps = []
+    for issue_type, markers in required.items():
+        if any(marker in text for marker in markers) and issue_type not in issue_types:
+            gaps.append(f"{issue_type.value} issue")
+    return gaps
+
+
+def _ensure_agent_issue_parse_complete(raw_issues: object, parsed_issues: list[IssueSpec]) -> None:
+    if raw_issues is None:
+        return
+    if not isinstance(raw_issues, list):
+        raise ValueError("issues must be a list")
+    issue_objects = [issue for issue in raw_issues if isinstance(issue, dict)]
+    if len(issue_objects) != len(parsed_issues):
+        raise ValueError(
+            "one or more agent-provided issue rules were unsupported or referenced "
+            "missing tables/columns"
+        )
+
+
+def _issue_parameter_reference_gaps(spec: ScenarioSpec) -> list[str]:
+    gaps: list[str] = []
+    for issue in spec.issues:
+        table = spec.table(issue.table)
+        columns = table.column_names()
+        issue_type = IssueType(issue.type)
+        if issue_type == IssueType.DATE_RULE_VIOLATION:
+            after_column = issue.parameters.get("after_column")
+            if not after_column or after_column not in columns:
+                gaps.append(f"{issue.issue_id} missing valid after_column")
+        elif issue_type == IssueType.LATE_ARRIVAL:
+            for parameter in ("event_time_column", "arrival_column"):
+                column = issue.parameters.get(parameter)
+                if column and column not in columns:
+                    gaps.append(f"{issue.issue_id} references missing {parameter} {column}")
+        elif issue_type == IssueType.SCHEMA_DRIFT:
+            for rename in issue.parameters.get("rename_columns", []):
+                if isinstance(rename, dict) and rename.get("from") not in columns:
+                    gaps.append(
+                        f"{issue.issue_id} renames missing column {rename.get('from')}"
+                    )
+            for change in issue.parameters.get("type_changes", []):
+                if isinstance(change, dict) and change.get("column") not in columns:
+                    gaps.append(
+                        f"{issue.issue_id} changes missing column {change.get('column')}"
+                    )
     return gaps
 
 
@@ -725,6 +1068,38 @@ def _blueprint_domain_from_prompt(text: str) -> str | None:
     if "insurance" in text:
         return "insurance_claims"
     return None
+
+
+def _requires_custom_schema_planning(text: str) -> bool:
+    explicit_structure_markers = (
+        "tables:",
+        "relationships:",
+        "business rules:",
+        "statistical anchors",
+        "settings:",
+        "one customer",
+        "north-east",
+        "northeast",
+        "census",
+        "log-normal",
+        "seasonal lift",
+    )
+    if any(marker in text for marker in explicit_structure_markers):
+        return True
+    requested_custom_tables = {
+        "returns",
+        "model_inferences",
+        "prompt_requests",
+        "feedback_scores",
+        "evaluation_results",
+        "incident_logs",
+        "tenant_metadata",
+    }
+    return any(table_name in text for table_name in requested_custom_tables)
+
+
+def _explicit_table_section(text: str) -> bool:
+    return "tables:" in text or "tables -" in text or "tables such as" in text
 
 
 def _heuristic_custom_spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
@@ -1647,7 +2022,7 @@ def _apply_custom_prompt_issues(spec: ScenarioSpec, text: str) -> ScenarioSpec:
 
     data = spec.model_dump(mode="json")
     data["issues"] = [
-        issue.model_dump(mode="json") for issue in _issues_from_intent(raw_issues, spec)
+        issue.model_dump(mode="json") for issue in _issues_from_intent(raw_issues, spec, text)
     ]
     return _ensure_timeline_supports_issue_batches(ScenarioSpec.model_validate(data))
 
@@ -1876,7 +2251,7 @@ def _apply_ai_model_ops_prompt_issues(spec: ScenarioSpec, text: str) -> Scenario
 
     data = spec.model_dump(mode="json")
     data["issues"] = [
-        issue.model_dump(mode="json") for issue in _issues_from_intent(raw_issues, spec)
+        issue.model_dump(mode="json") for issue in _issues_from_intent(raw_issues, spec, text)
     ]
     return _ensure_timeline_supports_issue_batches(ScenarioSpec.model_validate(data))
 
@@ -2261,7 +2636,9 @@ def _refresh_default_issue_counts(spec: ScenarioSpec) -> ScenarioSpec:
     return ScenarioSpec.model_validate(data)
 
 
-def _issues_from_intent(raw_issues: object, spec: ScenarioSpec) -> list[IssueSpec]:
+def _issues_from_intent(
+    raw_issues: object, spec: ScenarioSpec, prompt_context: str = ""
+) -> list[IssueSpec]:
     if not isinstance(raw_issues, list):
         return []
     tables = {table.name: table for table in spec.tables}
@@ -2275,7 +2652,7 @@ def _issues_from_intent(raw_issues: object, spec: ScenarioSpec) -> list[IssueSpe
         if issue_type not in {kind.value for kind in IssueType}:
             continue
         table, column, parameters, count, rate = _normalize_issue_intent(
-            str(issue_type), table, column, raw_issue, spec
+            str(issue_type), table, column, raw_issue, spec, prompt_context
         )
         if table not in tables:
             continue
@@ -2300,6 +2677,7 @@ def _normalize_issue_intent(
     column: object,
     raw_issue: dict[str, Any],
     spec: ScenarioSpec,
+    prompt_context: str = "",
 ) -> tuple[str | None, str | None, dict[str, Any], object, object]:
     table_names = {table_spec.name for table_spec in spec.tables}
     parameters = dict(raw_issue.get("parameters") or {})
@@ -2307,6 +2685,7 @@ def _normalize_issue_intent(
     rate = raw_issue.get("rate")
     table_name = str(table) if table else None
     column_name = str(column) if column else None
+    raw_issue_text = f"{prompt_context}\n{json.dumps(raw_issue, sort_keys=True)}".lower()
     if spec.domain == "insurance_claims":
         if issue_type in {IssueType.SCHEMA_DRIFT.value, IssueType.FILE_REPLAY.value}:
             table_name = table_name if table_name in table_names else "claims"
@@ -2337,6 +2716,13 @@ def _normalize_issue_intent(
         parameters.setdefault("target_batch", 12)
         if count is None and rate is None and parameters.get("file_count") is None:
             rate = 0.01
+    if (
+        issue_type == IssueType.DATE_RULE_VIOLATION.value
+        and parameters.get("after_column")
+        and "days_after" not in parameters
+        and "before" in raw_issue_text
+    ):
+        parameters["days_after"] = -1
     if (
         count is None
         and rate is None
@@ -2378,7 +2764,7 @@ def _agent_intent_from_model(prompt: str) -> tuple[dict[str, Any] | None, str]:
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=4000,
+            max_tokens=8000,
         )
         intent = _json_from_text(_response_text(response))
         if intent is None:
@@ -2403,7 +2789,7 @@ def _custom_schema_intent_from_model(prompt: str) -> dict[str, Any] | None:
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=4000,
+            max_tokens=8000,
         )
         return _json_from_text(_response_text(response))
     except Exception:
@@ -2432,11 +2818,84 @@ def _repair_custom_schema_intent_with_model(
                 ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
             ],
             temperature=0.0,
-            max_tokens=5000,
+            max_tokens=8000,
         )
         return _json_from_text(_response_text(response))
     except Exception:
         return None
+
+
+def _enrich_column_strategies_with_model(
+    prompt: str, intent: dict[str, Any], validation_error: str
+) -> dict[str, Any] | None:
+    endpoint = os.getenv("SDF_MODEL_ENDPOINT")
+    if not endpoint:
+        return None
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        payload = {
+            "user_prompt": prompt,
+            "validation_error": validation_error,
+            "schema_intent": intent,
+        }
+        response = WorkspaceClient().serving_endpoints.query(
+            endpoint,
+            messages=[
+                ChatMessage(role=ChatMessageRole.SYSTEM, content=_COLUMN_ENRICHMENT_PROMPT),
+                ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
+            ],
+            temperature=0.0,
+            max_tokens=8000,
+        )
+        return _json_from_text(_response_text(response))
+    except Exception:
+        return None
+
+
+def _merge_model_column_strategies(
+    intent: dict[str, Any], enrichment: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply only model-authored column strategies to the model's original schema."""
+    merged = json.loads(json.dumps(intent))
+    entries = enrichment.get("columns")
+    if not isinstance(entries, list):
+        return merged
+    tables = {
+        table.get("name"): table
+        for table in merged.get("table_specs", [])
+        if isinstance(table, dict)
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        table = tables.get(entry.get("table"))
+        if not isinstance(table, dict):
+            continue
+        target = next(
+            (
+                column
+                for column in table.get("columns", [])
+                if isinstance(column, dict) and column.get("name") == entry.get("column")
+            ),
+            None,
+        )
+        if not isinstance(target, dict):
+            continue
+        for key in ("faker", "values", "semantic", "min_value", "max_value"):
+            if key in entry:
+                target[key] = entry[key]
+        if "weights" in entry:
+            values = entry.get("values", target.get("values"))
+            weights = entry["weights"]
+            if (
+                isinstance(values, list)
+                and isinstance(weights, list)
+                and len(values) == len(weights)
+            ):
+                target["weights"] = weights
+    return merged
 
 
 def _complete_table_counts_with_model(
@@ -2555,6 +3014,9 @@ Allowed blueprint domains: insurance_claims, retail_orders.
 Allowed scales: small, demo.
 If the user asks for a domain or table shape outside those blueprints, use domain
 custom_schema and provide table_specs and relationships.
+If the prompt includes explicit "Tables", "Relationships", "Business rules",
+"Statistical anchors", "Settings", or tables that are not exactly in a blueprint,
+use custom_schema even if the domain words include retail, orders, or insurance.
 
 Blueprint table boundaries:
 - insurance_claims tables are exactly customers, policies, claims, payments.
@@ -2572,6 +3034,47 @@ file_replay, schema_drift, correlated_missingness.
 
 Allowed column types:
 string, integer, long, decimal, date, timestamp, boolean.
+
+Every non-key string column must include an executable semantic value strategy. Use
+exactly one of:
+- "faker": a supported provider: name, first_name, last_name, city, state,
+  state_abbr, street_address, postcode, company, job, email, user_name,
+  domain_name, url, sentence, paragraph, text, country, address, uuid4.
+- "values": a concise list of real domain values for constrained categories.
+- "semantic": {"kind":"lookup","key_column":"state",
+  "values_by_key":{"NY":["New York","Buffalo"],"PA":["Philadelphia","Pittsburgh"]}}
+  for a value that must be consistent with another column.
+
+Never use placeholders such as city_1, name_42, place_3, value_9, item_1, or a
+column-name concatenated with an ID. Do not leave a string column without one of
+these strategies. For people, organizations, addresses, cities, postal codes, and
+free text, select a suitable Faker provider. For categories, statuses, regions,
+model families, sources, and product/service labels, use real, meaningful values.
+For geographic guardrails, use a lookup when it is needed to keep city/state or
+region/country combinations coherent.
+
+Common semantic field choices: full_name/contact_name/person_name -> faker "name";
+first_name/last_name -> the matching Faker provider; company_name/merchant_name ->
+faker "company"; email -> faker "email"; account_number/bank_account -> faker
+"iban"; address fields -> Faker address/street_address/city/postcode. Apply these
+whenever you infer the fields from a short user prompt.
+
+Every non-key, non-foreign-key business column needs an executable strategy, not
+just string columns. Mark independently generated dates/timestamps with semantic
+{"kind":"timeline"}; use date_offset for dependent dates; use log_normal,
+uniform_range, or normal semantic rules for decimals; and give independent integer
+measures either numeric bounds or a semantic rule. Primary keys and declared foreign
+keys are structural and may be generated from their relationships. Never rely on a
+compiler default for a business field.
+
+For non-uniform categorical data, set "weights" beside "values" with one positive
+numeric weight per value. Convert population or percentage anchors into weights;
+for example a 65/35 channel split is values ["online", "in_store"] with weights
+[65, 35]. For a date that must follow another date, use semantic
+{"kind":"date_offset","base_column":"order_date","min_days":0,"max_days":7}.
+For a realistic monetary long tail, use semantic
+{"kind":"log_normal","median":85,"sigma":1.0,"max":5000} on a decimal column.
+These are executable generation rules, not metadata-only descriptions.
 
 Return this shape:
 {
@@ -2618,6 +3121,33 @@ Return:
 }
 """
 
+_COLUMN_ENRICHMENT_PROMPT = """
+You complete a Scenario Data Factory schema designed by another model.
+Return compact JSON only. Do not return tables, relationships, issues, commentary, or code.
+
+Input contains a user prompt, an existing schema_intent, and validation_error listing
+columns that lack executable data generation strategies. Return exactly:
+{"columns":[{"table":"...","column":"...","faker":"...","values":[],
+"weights":[],"semantic":{}}]}
+
+Return one entry for every missing column in validation_error. Do not change columns
+that are not listed. Supply only relevant keys for each entry.
+
+Rules:
+- person name fields: faker "name"; person first/last names: matching Faker provider.
+- account_number/bank_account: faker "iban"; company/merchant names: faker "company".
+- categories, statuses, currencies, and labels: meaningful values, with weights when needed.
+- independent date/timestamp: semantic {"kind":"timeline"}; dependent date:
+  {"kind":"date_offset","base_column":"existing_column","min_days":0,"max_days":7}.
+- decimal money/score/measure: semantic log_normal, uniform_range, or normal with
+  all needed numeric parameters. Example: {"kind":"log_normal","median":85,
+  "sigma":1.0,"max":5000}.
+- boolean: values [true, false] with meaningful weights.
+- independent integer/long business measures: min_value and max_value, or a semantic rule.
+- values must be real domain values, never name_1/city_1/field_42 placeholders.
+Use the user prompt and existing schema names to choose realistic strategies.
+"""
+
 _CUSTOM_SCHEMA_SYSTEM_PROMPT = """
 You are a bounded Scenario Data Factory custom-schema planner.
 Return compact JSON only. Do not include markdown or explanation.
@@ -2651,12 +3181,17 @@ Examples of entity interpretation:
 Include:
 - domain: "custom_schema"
 - name
+- locale when provided by the user
+- timeline when provided by the user, e.g.
+  {"start_date":"2025-01-01","batches":12,"frequency":"monthly"}
 - scale: "demo"
 - seed: 42
 - table_counts: {}
 - table_specs: a list of tables with row_count and columns
 - relationships: parent/child relationships
 - issues: supported issue rules
+- metadata: preserve business_rules, statistical_anchors, distribution_rules,
+  seasonality, output_settings, and assumptions as structured JSON
 
 Allowed column types:
 string, integer, long, decimal, date, timestamp, boolean.
@@ -2665,10 +3200,16 @@ Every table must have exactly one primary key column.
 Table names must be unique after lower_snake_case normalization.
 Column names must be unique within a table after lower_snake_case normalization.
 Foreign key columns must exist on child tables.
+Use relationship parent_filter {"column":"record_status","values":["delivered"]}
+when a child table must reference only a defined subset of parent records.
 Issues must reference existing tables and columns, except table-level issues.
 If the user supplies a count for a central fact/event table, preserve that count
 exactly and infer plausible counts for parent dimensions and downstream event tables.
 Use 4 to 8 tables for multi-entity domains unless the prompt explicitly asks for one table.
+If the user explicitly lists tables and columns, preserve those names. Add only columns
+needed for relationships, time behavior, or issue rules.
+If the user explicitly lists issue rules with table, column, and rate, preserve them exactly.
+Do not silently remap issue rules to another table.
 
 For healthcare claims, prefer tables like patients, providers, claims, adjudications,
 and payments when appropriate. Use patient_id/provider_id foreign keys on claims.
@@ -2685,6 +3226,16 @@ late feedback to feedback_scores.created_at with ingestion_ts as arrival column,
 inference files to file_replay on model_inferences, invalid model versions to
 model_inferences.model_version, invalid tenant regions to tenant_metadata.region, and
 feedback-before-inference to feedback_scores.created_at using inference_created_at.
+For retail sales guardrail prompts with customers, orders, and returns, preserve those
+tables. Treat a prompt like "Generate 500,000 records for a retail sales scenario"
+as orders=500000 unless the user explicitly assigns the count elsewhere. Preserve
+North-East US state rules in metadata. Use customers.state values from the requested
+states. Map duplicate_record on orders to orders, referential_orphan on customer_id
+to orders.customer_id, date_rule_violation "ship before order" to orders.ship_date
+with after_column order_date, and null_value on returns.reason to returns.reason.
+Use population-derived weights for customers.state, a state-keyed city lookup with
+real cities, weighted online/in_store values for channel, a log_normal amount rule,
+and a date_offset rule for clean ship_date values.
 
 Supported issue types:
 null_value, blank_value, duplicate_record, invalid_format, invalid_value,
@@ -2704,7 +3255,13 @@ Return shape:
       "row_count": 50000,
       "columns": [
         {"name": "patient_id", "type": "long", "primary_key": true, "nullable": false},
-        {"name": "province", "type": "string", "values": ["ON", "QC", "BC", "AB"]}
+        {"name": "province", "type": "string", "values": ["ON", "QC", "BC", "AB"]},
+        {"name": "city", "type": "string", "semantic": {
+          "kind": "lookup", "key_column": "province", "values_by_key": {
+            "ON": ["Toronto", "Ottawa"], "QC": ["Montreal", "Quebec City"],
+            "BC": ["Vancouver", "Victoria"], "AB": ["Calgary", "Edmonton"]
+          }
+        }}
       ]
     }
   ],
@@ -2743,9 +3300,72 @@ Return a corrected custom_schema intent with complete table_specs, relationships
 and issues. Preserve requested table counts, rates, and exact counts. Fix duplicate
 table names, duplicate column names, missing primary keys, missing FK columns, bad
 issue references, and semantic coverage gaps.
+Do not replace requested executable issue rules with prose-only diagnostic issue
+objects. Every returned issue must have a supported type, table, and rate, exact_count,
+or file_count.
+Also preserve requested locale, timeline, output mode, business rules, statistical
+anchors, distributions, seasonality, and table/column names in metadata. Do not replace
+explicit user-listed tables with a generic source/event schema.
 
 Every named business entity in the prompt must be represented as a table or a
 relationship-bearing column. Multi-entity prompts should use 4 to 8 related tables.
+
+Every non-key string column must use a real semantic value strategy: a supported
+Faker provider, meaningful categorical values, or a bounded semantic lookup tied
+to another existing column. Do not use ID-derived placeholders such as city_1,
+name_42, or source_7. Preserve geographic consistency with semantic lookups when
+the user requires it.
+
+Preserve every statistical or temporal guardrail as an executable column rule. Use
+values plus weights for population/percentage distributions, semantic
+{"kind":"log_normal",...} for a monetary long-tail request, and semantic
+{"kind":"date_offset",...} when one date must follow another. For a rule such as
+"returns only exist for delivered orders", add a meaningful delivered-status column
+to orders and put parent_filter {"column":"record_status","values":["delivered"]}
+on the orders-to-returns relationship. Do not leave these rules as metadata only.
+
+For a retail prompt mentioning population weighting, a 65/35 channel split,
+log-normal amounts, ordered shipping dates, and delivered-only returns, a compliant
+fragment has this shape (adapt the actual values to the user's request):
+{
+  "name":"state", "type":"string", "values":["NY","PA"],
+  "weights":[19500000,13000000]
+}
+{
+  "name":"city", "type":"string", "semantic":{"kind":"lookup",
+  "key_column":"state", "values_by_key":{"NY":["New York City","Buffalo"],
+  "PA":["Philadelphia","Pittsburgh"]}}
+}
+{
+  "name":"channel", "type":"string", "values":["online","in_store"],
+  "weights":[65,35]
+}
+{
+  "name":"amount", "type":"decimal", "precision":12, "scale":2,
+  "semantic":{"kind":"log_normal","median":85,"sigma":1.0,"max":5000}
+}
+{
+  "name":"ship_date", "type":"date", "semantic":{"kind":"date_offset",
+  "base_column":"order_date","min_days":0,"max_days":7}
+}
+The independent order_date must use semantic {"kind":"timeline"}. A monetary
+returns.refund_amount must also use an explicit numeric distribution, such as a
+log_normal rule with a realistic lower median and the same maximum bound.
+The orders table also needs record_status values including "delivered", and the
+orders-to-returns relationship needs parent_filter
+{"column":"record_status","values":["delivered"]}. This is an example of
+the contract, not a reason to replace the user's tables or names.
+For a returns.reason field, include meaningful values such as
+["defective", "wrong_item", "changed_mind", "damaged_in_transit"] rather than
+leaving it without a generation strategy.
+Every non-key, non-foreign-key business field must be explicit: use timeline for
+independent dates, date_offset for dependent dates, a stated distribution for every
+decimal, numeric bounds/semantics for independent numeric measures, and real values,
+lookups, or Faker for strings. No field may rely on a generic compiler default.
+For a financial-crime or banking schema inferred from a short prompt, use faker
+"name" for suspects.full_name (or equivalent person names), faker "iban" for
+accounts.account_number, meaningful categorical values for risk/status/type fields,
+and explicit date/numeric rules for every business measure.
 
 Allowed column types:
 string, integer, long, decimal, date, timestamp, boolean.

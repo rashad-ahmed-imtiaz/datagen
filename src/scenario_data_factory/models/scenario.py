@@ -65,6 +65,8 @@ class ColumnSpec(BaseModel):
     primary_key: bool = False
     faker: str | None = None
     values: list[Any] | None = None
+    weights: list[float] | None = None
+    semantic: dict[str, Any] | None = None
     min_value: int | Decimal | None = None
     max_value: int | Decimal | None = None
     precision: int | None = None
@@ -85,6 +87,17 @@ class ColumnSpec(BaseModel):
                 val = getattr(self, attr)
                 if isinstance(val, Decimal):
                     setattr(self, attr, val.quantize(quant, rounding=ROUND_HALF_UP))
+        return self
+
+    @model_validator(mode="after")
+    def validate_weighted_values(self) -> ColumnSpec:
+        if self.weights is None:
+            return self
+        if not self.values or len(self.weights) != len(self.values):
+            self.weights = None
+            return self
+        if any(weight <= 0 for weight in self.weights):
+            self.weights = None
         return self
 
 
@@ -126,6 +139,7 @@ class RelationshipSpec(BaseModel):
     child_table: Identifier
     child_column: Identifier
     required: bool = True
+    parent_filter: dict[str, Any] | None = None
 
 
 class TimelineSpec(BaseModel):
@@ -133,7 +147,7 @@ class TimelineSpec(BaseModel):
 
     start_date: date
     batches: int = Field(gt=0)
-    frequency: Literal["daily"] = "daily"
+    frequency: Literal["daily", "monthly"] = "daily"
 
 
 class OutputSpec(BaseModel):
@@ -204,6 +218,15 @@ class ScenarioSpec(BaseModel):
                 raise ValueError(f"relationship {rel.name} references missing parent column")
             if rel.child_column not in tables[rel.child_table].column_names():
                 raise ValueError(f"relationship {rel.name} references missing child column")
+            if rel.parent_filter:
+                filter_column = rel.parent_filter.get("column")
+                filter_values = rel.parent_filter.get("values")
+                if filter_column not in tables[rel.parent_table].column_names():
+                    raise ValueError(
+                        f"relationship {rel.name} filter references missing parent column"
+                    )
+                if not isinstance(filter_values, list) or not filter_values:
+                    raise ValueError(f"relationship {rel.name} filter requires values")
         for issue in self.issues:
             if issue.table not in tables:
                 raise ValueError(f"issue {issue.issue_id} references missing table {issue.table}")

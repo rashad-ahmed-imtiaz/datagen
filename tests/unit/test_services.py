@@ -479,7 +479,19 @@ def test_semantically_incomplete_agent_schema_is_repaired(tmp_path, monkeypatch)
                     "child_column": "event_source_id",
                 }
             ],
-            "issues": [],
+            "issues": [
+                {
+                    "type": "late_arrival",
+                    "table": "incident_closures",
+                    "column": "closure_ts",
+                    "rate": 0.10,
+                    "parameters": {
+                        "semantics": "late_arriving_data",
+                        "event_time_column": "closure_ts",
+                        "arrival_column": "ingestion_ts",
+                    },
+                }
+            ],
         },
     )
     monkeypatch.setattr(
@@ -593,7 +605,40 @@ def test_semantically_incomplete_agent_schema_is_repaired(tmp_path, monkeypatch)
                     "child_column": "incident_id",
                 },
             ],
-            "issues": [],
+            "issues": [
+                {
+                    "type": "referential_orphan",
+                    "table": "network_events",
+                    "column": "tower_id",
+                    "rate": 0.01,
+                    "parameters": {},
+                },
+                {
+                    "type": "null_value",
+                    "table": "incidents",
+                    "column": "assigned_engineer_id",
+                    "rate": 0.01,
+                    "parameters": {},
+                },
+                {
+                    "type": "late_arrival",
+                    "table": "incident_closures",
+                    "column": "closure_ts",
+                    "rate": 0.01,
+                    "parameters": {
+                        "semantics": "late_arriving_data",
+                        "event_time_column": "closure_ts",
+                        "arrival_column": "ingestion_ts",
+                    },
+                },
+                {
+                    "type": "invalid_value",
+                    "table": "customer_regions",
+                    "column": "region_code",
+                    "rate": 0.01,
+                    "parameters": {"value": "REGION_@@"},
+                },
+            ],
         },
     )
     service = ScenarioService(
@@ -871,6 +916,187 @@ def test_retail_promotions_adds_requested_fk_columns_to_primary_table(
     assert {"product_id", "store_id"}.issubset(promotion_columns)
     assert ("referential_orphan", "promotions", "product_id") in issue_targets
     assert ("null_value", "promotions", "store_id") in issue_targets
+
+
+def test_rich_retail_sales_prompt_uses_agent_custom_schema_without_keyword_remap(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        scenario_service,
+        "_custom_schema_intent_from_model",
+        lambda prompt: {
+            "domain": "custom_schema",
+            "name": "North East Retail Sales",
+            "seed": 42,
+            "locale": "en-US",
+            "timeline": {
+                "start_date": "2025-01-01",
+                "batches": 12,
+                "frequency": "monthly",
+            },
+            "metadata": {
+                "business_rules": [
+                    "Sales only occur in North-East US states.",
+                    "Returns only exist for delivered orders.",
+                    "ship_date must be on or after order_date.",
+                ],
+                "statistical_anchors": {
+                    "state_population_weights": {
+                        "NY": 19_500_000,
+                        "PA": 13_000_000,
+                        "NJ": 9_300_000,
+                        "MA": 7_000_000,
+                        "CT": 3_600_000,
+                        "ME": 1_400_000,
+                        "NH": 1_400_000,
+                        "RI": 1_100_000,
+                        "VT": 650_000,
+                    },
+                    "order_amount_distribution": {
+                        "type": "log_normal",
+                        "median": 85,
+                        "long_tail_max": 5000,
+                    },
+                    "channel_mix": {"online": 0.65, "in_store": 0.35},
+                    "seasonality": {"nov_dec_lift": 0.40},
+                },
+            },
+            "table_specs": [
+                {
+                    "name": "customers",
+                    "row_count": 150_000,
+                    "columns": [
+                        {
+                            "name": "customer_id",
+                            "type": "long",
+                            "primary_key": True,
+                            "nullable": False,
+                        },
+                        {
+                            "name": "state",
+                            "type": "string",
+                            "values": ["NY", "PA", "NJ", "MA", "CT", "ME", "NH", "RI", "VT"],
+                        },
+                        {"name": "city", "type": "string"},
+                        {"name": "segment", "type": "string"},
+                    ],
+                },
+                {
+                    "name": "orders",
+                    "row_count": 500_000,
+                    "columns": [
+                        {
+                            "name": "order_id",
+                            "type": "long",
+                            "primary_key": True,
+                            "nullable": False,
+                        },
+                        {"name": "customer_id", "type": "long", "nullable": False},
+                        {"name": "order_date", "type": "date"},
+                        {"name": "ship_date", "type": "date"},
+                        {"name": "amount", "type": "decimal"},
+                        {"name": "channel", "type": "string", "values": ["online", "in_store"]},
+                        {"name": "record_status", "type": "string", "values": ["delivered"]},
+                    ],
+                },
+                {
+                    "name": "returns",
+                    "row_count": 40_000,
+                    "columns": [
+                        {
+                            "name": "return_id",
+                            "type": "long",
+                            "primary_key": True,
+                            "nullable": False,
+                        },
+                        {"name": "order_id", "type": "long", "nullable": False},
+                        {"name": "reason", "type": "string"},
+                        {"name": "refund_amount", "type": "decimal"},
+                    ],
+                },
+            ],
+            "relationships": [
+                {
+                    "name": "customers_orders",
+                    "parent_table": "customers",
+                    "parent_column": "customer_id",
+                    "child_table": "orders",
+                    "child_column": "customer_id",
+                },
+                {
+                    "name": "orders_returns",
+                    "parent_table": "orders",
+                    "parent_column": "order_id",
+                    "child_table": "returns",
+                    "child_column": "order_id",
+                },
+            ],
+            "issues": [
+                {
+                    "type": "duplicate_record",
+                    "table": "orders",
+                    "column": None,
+                    "rate": 0.01,
+                    "parameters": {},
+                },
+                {
+                    "type": "referential_orphan",
+                    "table": "orders",
+                    "column": "customer_id",
+                    "rate": 0.02,
+                    "parameters": {},
+                },
+                {
+                    "type": "date_rule_violation",
+                    "table": "orders",
+                    "column": "ship_date",
+                    "rate": 0.005,
+                    "parameters": {"after_column": "order_date", "days_after": -1},
+                },
+                {
+                    "type": "null_value",
+                    "table": "returns",
+                    "column": "reason",
+                    "rate": 0.03,
+                    "parameters": {},
+                },
+            ],
+        },
+    )
+    service = ScenarioService(
+        ScenarioRepository(tmp_path / "scenarios"),
+        RunRepository(tmp_path / "runs"),
+    )
+
+    result = service.create_scenario_from_prompt(
+        "Generate 500,000 records for a retail sales scenario. Business rules: "
+        "Sales only occur in North-East US states. Order volume per state is "
+        "proportional to its population. ship_date must be on or after order_date. "
+        "Returns only exist for delivered orders. Tables: customers, orders, returns. "
+        "Relationships: one customer to many orders to some returns. Data issues: "
+        "duplicate_record on orders 1%, referential_orphan on customer_id 2%, "
+        "date_rule_violation ship before order 0.5%, null_value on returns.reason 3%. "
+        "Settings: seed 42, timeline 2025-01-01 across 12 monthly batches, locale en-US, "
+        "output Delta + raw."
+    )
+
+    assert result["domain"] == "custom_schema"
+    assert result["tables"] == {"customers": 150_000, "orders": 500_000, "returns": 40_000}
+    assert result["timeline"] == {
+        "start_date": "2025-01-01",
+        "batches": 12,
+        "frequency": "monthly",
+    }
+    assert result["metadata"]["statistical_anchors"]["channel_mix"] == {
+        "online": 0.65,
+        "in_store": 0.35,
+    }
+    issue_targets = {(issue["type"], issue["table"], issue["column"]) for issue in result["issues"]}
+    assert ("duplicate_record", "orders", None) in issue_targets
+    assert ("referential_orphan", "orders", "customer_id") in issue_targets
+    assert ("date_rule_violation", "orders", "ship_date") in issue_targets
+    assert ("null_value", "returns", "reason") in issue_targets
+    assert any("Schema-design agent designed" in warning for warning in result["warnings"])
 
 
 def test_late_closure_adds_ingestion_column_for_late_arrival(tmp_path, monkeypatch) -> None:

@@ -41,8 +41,16 @@ def compile_column(column: ColumnSpec) -> DatagenColumn:
     options: dict[str, Any] = {}
     if column.primary_key:
         options["expr"] = "id + 1"
+    elif column.faker:
+        # Resolved by the engine, where the scenario locale is available.
+        options["faker"] = column.faker
     elif column.values:
         options["values"] = column.values
+        if column.weights:
+            total = sum(column.weights)
+            options["weights"] = [
+                max(1, round(float(weight) / total * 10_000)) for weight in column.weights
+            ]
     elif column.min_value is not None or column.max_value is not None:
         if column.min_value is not None:
             options["minValue"] = column.min_value
