@@ -318,11 +318,34 @@
       status.textContent = message;
       try {
         return await fn();
-      } catch (error) {
-        status.textContent = 'Error: ' + error.message;
-        say('agent', 'That failed: ' + error.message);
+      } catch {
+        status.textContent = 'The planner could not complete this draft. No data was generated.';
+        say('agent', 'I could not complete a valid executable draft after retrying. No data was generated. Please submit the request again.');
         return null;
       }
+    }
+
+    function wait(milliseconds) {
+      return new Promise((resolve) => setTimeout(resolve, milliseconds));
+    }
+
+    async function draftWithRecovery(prompt) {
+      let lastError = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          return await api('/api/agent/draft', {
+            method: 'POST',
+            body: JSON.stringify({prompt})
+          });
+        } catch (error) {
+          lastError = error;
+          if (attempt < 2) {
+            status.textContent = 'Refining the agent plan...';
+            await wait(750);
+          }
+        }
+      }
+      throw lastError || new Error('Scenario planner unavailable');
     }
 
     function renderScenario(data) {
@@ -364,7 +387,8 @@
         (data.relationships || []).map((relationship) => [
           relationship.parent_table + '.' + relationship.parent_column +
             (relationship.parent_filter ? ' [' + relationship.parent_filter.column +
-              ' in ' + relationship.parent_filter.values.join(', ') + ']' : ''),
+              ' in ' + relationship.parent_filter.values.join(', ') + ']' : '') +
+            (relationship.constraints ? ' [constraints]' : ''),
           relationship.child_table + '.' + relationship.child_column
         ])
       );
@@ -400,6 +424,12 @@
 
     function summarizeIssueDetails(issue) {
       const p = issue.parameters || {};
+      if (issue.correlation) {
+        const where = issue.correlation.where || {};
+        return 'correlated share: ' + issue.correlation.share +
+          '; ' + (where.source_system || where.source_value || 'eligible source') +
+          ' after batch ' + (where.after_batch ?? '-');
+      }
       if (issue.type === 'duplicate_record') {
         return p.duplicate_semantics || 'exact_record_duplicate';
       }
@@ -435,12 +465,7 @@
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return;
       say('user', prompt);
-      const data = await action('Drafting scenario...', () => {
-        return api('/api/agent/draft', {
-          method: 'POST',
-          body: JSON.stringify({prompt})
-        });
-      });
+      const data = await action('Drafting scenario...', () => draftWithRecovery(prompt));
       if (!data) return;
       renderScenario(data);
       say('agent', 'Drafted ' + data.name + ' with ' + data.issues.length + ' issue rules.');

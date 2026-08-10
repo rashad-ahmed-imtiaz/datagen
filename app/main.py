@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from scenario_data_factory.app_services.scenario_service import ScenarioService
+from scenario_data_factory.app_services.scenario_service import AgentPlanningError, ScenarioService
 
 app = FastAPI(title="Scenario Data Factory")
 service = ScenarioService()
@@ -46,8 +46,17 @@ async def health() -> dict[str, str]:
 async def create_scenario_from_prompt(request: PromptDraftRequest) -> dict[str, object]:
     try:
         return service.create_scenario_from_prompt(request.prompt)
+    except AgentPlanningError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        print("Unexpected scenario draft validation failure:", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The scenario planner could not complete an executable draft. "
+                "No data or tables were created; please submit the request again."
+            ),
+        ) from exc
 
 
 @app.post("/api/scenarios")

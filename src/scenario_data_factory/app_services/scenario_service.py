@@ -28,6 +28,10 @@ from scenario_data_factory.persistence.run_repository import RunRepository
 from scenario_data_factory.persistence.scenario_repository import ScenarioRepository
 
 
+class AgentPlanningError(ValueError):
+    """Raised only after the model planner exhausts its internal recovery attempts."""
+
+
 class ScenarioService:
     def __init__(
         self,
@@ -196,6 +200,7 @@ def _summary(spec: ScenarioSpec, warnings: list[str]) -> dict[str, object]:
                 "child_table": relationship.child_table,
                 "child_column": relationship.child_column,
                 "parent_filter": relationship.parent_filter,
+                "constraints": relationship.constraints,
             }
             for relationship in spec.relationships
         ],
@@ -211,6 +216,7 @@ def _summary(spec: ScenarioSpec, warnings: list[str]) -> dict[str, object]:
                 "unit": _issue_unit(issue),
                 "display_value": _issue_display_value(issue),
                 "parameters": issue.parameters,
+                "correlation": issue.correlation,
             }
             for issue in spec.issues
         ],
@@ -252,59 +258,99 @@ def _spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
 
 
 def _custom_spec_from_agent_or_fallback(prompt: str) -> tuple[ScenarioSpec, list[str]]:
-    intent: dict[str, Any] | None = None
+    failures: list[str] = []
     for _ in range(3):
-        candidate = _custom_schema_intent_from_model(prompt)
-        if candidate and isinstance(candidate.get("table_specs"), list):
-            intent = candidate
-            break
-    if intent and isinstance(intent.get("table_specs"), list):
-        try:
-            spec, assumptions = _custom_spec_from_intent(intent, prompt)
-            return spec, ["Schema-design agent designed the custom ScenarioSpec.", *assumptions]
-        except Exception as exc:
-            current_intent = intent
-            current_error = str(exc)
-            enriched = _enrich_column_strategies_with_model(prompt, current_intent, current_error)
-            if enriched:
-                current_intent = _merge_model_column_strategies(current_intent, enriched)
-                try:
-                    spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
-                    return spec, [
-                        "Schema-design agent completed its field-generation contract.",
-                        *assumptions,
-                    ]
-                except Exception as enrichment_exc:
-                    current_error = str(enrichment_exc)
-            for attempt in range(1, 4):
-                repaired = _repair_custom_schema_intent_with_model(
-                    prompt, current_intent, current_error
-                )
-                if not repaired or not isinstance(repaired.get("table_specs"), list):
-                    fallback_note = f"Schema-design agent output was invalid: {current_error}"
-                    break
-                repaired = _normalize_repaired_intent(repaired, current_intent)
-                try:
-                    spec, assumptions = _custom_spec_from_intent(repaired, prompt)
-                    return spec, [
-                        f"Schema-design agent repaired its draft on attempt {attempt}.",
-                        *assumptions,
-                    ]
-                except Exception as repair_exc:
-                    current_intent = repaired
-                    current_error = str(repair_exc)
-            else:
-                fallback_note = (
-                    "Schema-design repair agent returned three invalid drafts: "
-                    f"{current_error}"
-                )
-    else:
-        fallback_note = "Schema-design agent did not return usable table_specs."
+        intent = _custom_schema_intent_from_model(prompt)
+        if not intent or not isinstance(intent.get("table_specs"), list):
+            failures.append("planner returned no usable schema")
+            continue
+        spec, assumptions, failure = _complete_agent_schema_contract(prompt, intent)
+        if spec is not None:
+            return spec, [
+                "Schema-design agent designed and verified the custom ScenarioSpec.",
+                *assumptions,
+            ]
+        failures.append(failure)
 
-    raise ValueError(
-        f"{fallback_note} Repair did not produce a valid ScenarioSpec; no deterministic "
-        "fallback was used."
+    print("Scenario agent exhausted planning attempts:", " | ".join(failures))
+    raise AgentPlanningError(
+        "The scenario planner could not complete an executable draft after internal recovery. "
+        "No data or tables were created; please submit the request again."
     )
+
+
+def _complete_agent_schema_contract(
+    prompt: str, intent: dict[str, Any]
+) -> tuple[ScenarioSpec | None, list[str], str]:
+    """Validate an agent draft and let focused agent passes complete its missing contracts."""
+    current_intent = intent
+    try:
+        spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
+        return spec, assumptions, ""
+    except Exception as exc:
+        current_error = str(exc)
+
+    enrichments: tuple[
+        tuple[
+            Any,
+            Any,
+            str,
+        ],
+        ...,
+    ] = (
+        (
+            _enrich_column_strategies_with_model,
+            _merge_model_column_strategies,
+            "field-generation",
+        ),
+        (
+            _enrich_issue_parameters_with_model,
+            _merge_model_issue_parameters,
+            "issue-execution",
+        ),
+        (
+            _enrich_operational_contracts_with_model,
+            _merge_model_operational_contracts,
+            "operational-execution",
+        ),
+        (
+            _enrich_relationship_contracts_with_model,
+            _merge_model_relationship_contracts,
+            "relationship-execution",
+        ),
+        (
+            _enrich_column_strategies_with_model,
+            _merge_model_column_strategies,
+            "field-generation-convergence",
+        ),
+        (
+            _enrich_issue_parameters_with_model,
+            _merge_model_issue_parameters,
+            "issue-execution-convergence",
+        ),
+    )
+    for enrich, merge, _contract_name in enrichments:
+        enrichment = enrich(prompt, current_intent, current_error)
+        if not enrichment:
+            continue
+        current_intent = merge(current_intent, enrichment)
+        try:
+            spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
+            return spec, assumptions, ""
+        except Exception as exc:
+            current_error = str(exc)
+
+    for _ in range(3):
+        repaired = _repair_custom_schema_intent_with_model(prompt, current_intent, current_error)
+        if not repaired or not isinstance(repaired.get("table_specs"), list):
+            break
+        current_intent = _normalize_repaired_intent(repaired, current_intent)
+        try:
+            spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
+            return spec, assumptions, ""
+        except Exception as exc:
+            current_error = str(exc)
+    return None, [], current_error
 
 
 def _heuristic_spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
@@ -450,6 +496,7 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
         *_custom_semantic_gaps(spec, prompt),
         *_semantic_value_generation_gaps(spec),
         *_execution_rule_gaps(spec, prompt),
+        *_insurance_execution_rule_gaps(spec, prompt),
         *_custom_issue_gaps(spec, prompt),
         *_issue_parameter_reference_gaps(spec),
     ]
@@ -924,6 +971,179 @@ def _execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
         parent_filter = relation.parent_filter if relation else None
         if not parent_filter or "delivered" not in parent_filter.get("values", []):
             gaps.append("orders-to-returns delivered-order relationship filter")
+    return gaps
+
+
+def _insurance_execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
+    """Require the agent to encode explicit insurance rules as executable contracts."""
+    text = prompt.lower()
+    tables = {table.name: table for table in spec.tables}
+    if not {"customers", "policies", "claims", "payments"}.issubset(tables):
+        return []
+
+    def column(table_name: str, column_name: str) -> ColumnSpec | None:
+        return next(
+            (item for item in tables[table_name].columns if item.name == column_name), None
+        )
+
+    def weights_match(column_spec: ColumnSpec | None, expected: dict[str, float]) -> bool:
+        if not column_spec or not column_spec.values or not column_spec.weights:
+            return False
+        weights = {
+            str(value): float(weight)
+            for value, weight in zip(column_spec.values, column_spec.weights, strict=False)
+        }
+        total = sum(weights.values())
+        return total > 0 and all(
+            abs(weights.get(value, 0.0) / total - fraction) <= 0.02
+            for value, fraction in expected.items()
+        )
+
+    def relationship(parent: str, child: str) -> RelationshipSpec | None:
+        return next(
+            (
+                item
+                for item in spec.relationships
+                if item.parent_table == parent and item.child_table == child
+            ),
+            None,
+        )
+
+    gaps: list[str] = []
+    if all(token in text for token in ("55% auto", "30% home", "15% tenant")):
+        if not weights_match(
+            column("policies", "policy_type"), {"auto": 0.55, "home": 0.30, "tenant": 0.15}
+        ):
+            gaps.append("weighted policies.policy_type distribution")
+    if "70% of claims should be closed or settled" in text:
+        status = column("claims", "claim_status")
+        if not status or not status.values or not status.weights:
+            gaps.append("weighted claims.claim_status distribution")
+        else:
+            weights = {
+                str(value): float(weight)
+                for value, weight in zip(status.values, status.weights, strict=False)
+            }
+            total = sum(weights.values())
+            closed_or_settled = (weights.get("closed", 0.0) + weights.get("settled", 0.0)) / max(
+                total, 1.0
+            )
+            if total <= 0 or abs(closed_or_settled - 0.70) > 0.02:
+                gaps.append("70% closed-or-settled claims distribution")
+    if "ontario and quebec should have the largest volume" in text:
+        province = column("policies", "province")
+        if not province or not province.values or not province.weights:
+            gaps.append("weighted Canadian province volume")
+        else:
+            weights = {
+                str(value): float(weight)
+                for value, weight in zip(province.values, province.weights, strict=False)
+            }
+            if not {"ON", "QC", "AB", "BC"}.issubset(weights) or min(
+                weights["ON"], weights["QC"]
+            ) <= max(weights["AB"], weights["BC"]):
+                gaps.append("Ontario-and-Quebec largest province volumes")
+    if "long tail above $100,000" in text or "long tail above 100,000" in text:
+        amount = column("claims", "claim_amount")
+        semantic = amount.semantic if amount else {}
+        if (
+            not isinstance(semantic, dict)
+            or semantic.get("kind") != "log_normal"
+            or not isinstance(semantic.get("tail_share"), (int, float))
+            or semantic.get("tail_share", 0) <= 0
+            or not isinstance(semantic.get("tail_min"), (int, float))
+            or semantic.get("tail_min", 0) < 100_000
+        ):
+            gaps.append("material claims.claim_amount tail above 100000")
+    policy_claims = relationship("policies", "claims")
+    if "active policy on the loss_date" in text:
+        constraints = policy_claims.constraints if policy_claims else {}
+        ranges = constraints.get("child_date_ranges", []) if isinstance(constraints, dict) else []
+        valid_range = any(
+            isinstance(rule, dict)
+            and rule.get("child_column") == "loss_date"
+            and rule.get("parent_start_column") == "effective_date"
+            and rule.get("parent_end_column") == "expiry_date"
+            for rule in ranges
+        )
+        if (
+            not policy_claims
+            or policy_claims.parent_filter != {"column": "status", "values": ["active"]}
+            or not valid_range
+        ):
+            gaps.append("active-policy loss-date relationship constraint")
+    settlement = column("claims", "settlement_date")
+    if "settlement_date must be on or after loss_date" in text and (
+        not settlement
+        or (settlement.semantic or {}).get("kind") != "date_offset"
+        or (settlement.semantic or {}).get("base_column") != "loss_date"
+        or (settlement.semantic or {}).get("min_days", -1) < 0
+    ):
+        gaps.append("non-negative claims.settlement_date offset")
+    claims_payments = relationship("claims", "payments")
+    if "payments can only exist for approved or settled claims" in text:
+        expected = {"column": "claim_status", "values": ["approved", "settled"]}
+        if not claims_payments or claims_payments.parent_filter != expected:
+            gaps.append("approved-or-settled claims-to-payments filter")
+    if "total payments for a claim should normally not exceed claim_amount" in text:
+        constraints = claims_payments.constraints if claims_payments else {}
+        caps = constraints.get("aggregate_caps", []) if isinstance(constraints, dict) else []
+        payment_amount_columns = {"amount", "payment_amount"} & tables["payments"].column_names()
+        if not any(
+            isinstance(rule, dict)
+            and rule.get("child_amount_column") in payment_amount_columns
+            and rule.get("parent_amount_column") == "claim_amount"
+            and isinstance(rule.get("maximum_fraction"), (int, float))
+            and rule["maximum_fraction"] <= 1
+            for rule in caps
+        ):
+            gaps.append("aggregate payments.amount cap by claims.claim_amount")
+    if "late_arrival on payments" in text:
+        late = next(
+            (
+                issue
+                for issue in spec.issues
+                if IssueType(issue.type) == IssueType.LATE_ARRIVAL and issue.table == "payments"
+            ),
+            None,
+        )
+        parameters = late.parameters if late else {}
+        arrival_column = parameters.get("arrival_column")
+        if (
+            not late
+            or late.rate != 0.05
+            or parameters.get("event_time_column") != "payment_date"
+            or not isinstance(arrival_column, str)
+            or arrival_column not in tables["payments"].column_names()
+            or parameters.get("delay_days_min") != 1
+            or parameters.get("delay_days_max") != 7
+        ):
+            gaps.append("5% late payments event-to-ingestion contract")
+    if "half" in text and "missing adjuster" in text and "legacy_batch" in text:
+        missing = next(
+            (
+                issue
+                for issue in spec.issues
+                if IssueType(issue.type) == IssueType.NULL_VALUE
+                and issue.table == "claims"
+                and issue.column == "adjuster_id"
+            ),
+            None,
+        )
+        correlation = (
+            (missing.correlation if missing else None)
+            or (missing.parameters.get("correlation") if missing else None)
+            or {}
+        )
+        where = correlation.get("where") if isinstance(correlation, dict) else {}
+        if (
+            not missing
+            or missing.rate != 0.04
+            or correlation.get("share") != 0.5
+            or where.get("source_system") != "legacy_batch"
+            or where.get("after_batch") != 6
+        ):
+            gaps.append("half-correlated legacy-batch adjuster missingness")
     return gaps
 
 
@@ -2666,6 +2886,7 @@ def _issues_from_intent(
             exact_count=int(count) if count is not None else None,
             rate=float(rate) if count is None and rate is not None else None,
             parameters=parameters,
+            correlation=raw_issue.get("correlation"),
         )
         result.append(issue)
     return result
@@ -2764,7 +2985,7 @@ def _agent_intent_from_model(prompt: str) -> tuple[dict[str, Any] | None, str]:
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=8000,
+            max_tokens=16000,
         )
         intent = _json_from_text(_response_text(response))
         if intent is None:
@@ -2789,7 +3010,7 @@ def _custom_schema_intent_from_model(prompt: str) -> dict[str, Any] | None:
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=8000,
+            max_tokens=16000,
         )
         return _json_from_text(_response_text(response))
     except Exception:
@@ -2818,7 +3039,7 @@ def _repair_custom_schema_intent_with_model(
                 ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
             ],
             temperature=0.0,
-            max_tokens=8000,
+            max_tokens=16000,
         )
         return _json_from_text(_response_text(response))
     except Exception:
@@ -2882,7 +3103,12 @@ def _merge_model_column_strategies(
             None,
         )
         if not isinstance(target, dict):
-            continue
+            if isinstance(entry.get("column"), str) and entry.get("type"):
+                target = {key: value for key, value in entry.items() if key != "table"}
+                target["name"] = target.pop("column")
+                table.setdefault("columns", []).append(target)
+            else:
+                continue
         for key in ("faker", "values", "semantic", "min_value", "max_value"):
             if key in entry:
                 target[key] = entry[key]
@@ -2895,6 +3121,221 @@ def _merge_model_column_strategies(
                 and len(values) == len(weights)
             ):
                 target["weights"] = weights
+    return merged
+
+
+def _enrich_issue_parameters_with_model(
+    prompt: str, intent: dict[str, Any], validation_error: str
+) -> dict[str, Any] | None:
+    """Ask the planner to complete execution parameters without changing its schema."""
+    endpoint = os.getenv("SDF_MODEL_ENDPOINT")
+    if not endpoint:
+        return None
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        payload = {
+            "user_prompt": prompt,
+            "validation_error": validation_error,
+            "schema_intent": intent,
+        }
+        response = WorkspaceClient().serving_endpoints.query(
+            endpoint,
+            messages=[
+                ChatMessage(role=ChatMessageRole.SYSTEM, content=_ISSUE_ENRICHMENT_PROMPT),
+                ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
+            ],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        return _json_from_text(_response_text(response))
+    except Exception:
+        return None
+
+
+def _merge_model_issue_parameters(
+    intent: dict[str, Any], enrichment: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge only planner-supplied issue parameters into the original issue plan."""
+    merged = json.loads(json.dumps(intent))
+    entries = enrichment.get("issues")
+    issues = merged.get("issues")
+    if not isinstance(entries, list) or not isinstance(issues, list):
+        return merged
+
+    for entry in entries:
+        if not isinstance(entry, dict) or (
+            not isinstance(entry.get("parameters"), dict)
+            and not isinstance(entry.get("correlation"), dict)
+        ):
+            continue
+        target = next(
+            (
+                issue
+                for issue in issues
+                if isinstance(issue, dict)
+                and (
+                    entry.get("issue_id")
+                    and entry.get("issue_id") == issue.get("issue_id")
+                    or (
+                        entry.get("type") == issue.get("type")
+                        and entry.get("table") == issue.get("table")
+                        and entry.get("column") == issue.get("column")
+                    )
+                )
+            ),
+            None,
+        )
+        if isinstance(target, dict):
+            if isinstance(entry.get("parameters"), dict):
+                parameters = target.setdefault("parameters", {})
+                if isinstance(parameters, dict):
+                    parameters.update(entry["parameters"])
+            if isinstance(entry.get("correlation"), dict):
+                target["correlation"] = entry["correlation"]
+    return merged
+
+
+def _enrich_operational_contracts_with_model(
+    prompt: str, intent: dict[str, Any], validation_error: str
+) -> dict[str, Any] | None:
+    """Complete a cross-cutting issue contract that requires both a new field and parameters."""
+    endpoint = os.getenv("SDF_MODEL_ENDPOINT")
+    if not endpoint:
+        return None
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        response = WorkspaceClient().serving_endpoints.query(
+            endpoint,
+            messages=[
+                ChatMessage(role=ChatMessageRole.SYSTEM, content=_OPERATIONAL_ENRICHMENT_PROMPT),
+                ChatMessage(
+                    role=ChatMessageRole.USER,
+                    content=json.dumps(
+                        {
+                            "user_prompt": prompt,
+                            "validation_error": validation_error,
+                            "schema_intent": intent,
+                        }
+                    ),
+                ),
+            ],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        return _json_from_text(_response_text(response))
+    except Exception:
+        return None
+
+
+def _merge_model_operational_contracts(
+    intent: dict[str, Any], enrichment: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge a model-authored cross-cutting patch using the existing narrow mergers."""
+    merged = _merge_model_column_strategies(intent, enrichment)
+    return _merge_model_issue_parameters(merged, enrichment)
+
+
+def _enrich_relationship_contracts_with_model(
+    prompt: str, intent: dict[str, Any], validation_error: str
+) -> dict[str, Any] | None:
+    """Ask the planner to complete parent-filter contracts without replacing its schema."""
+    endpoint = os.getenv("SDF_MODEL_ENDPOINT")
+    if not endpoint:
+        return None
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        payload = {
+            "user_prompt": prompt,
+            "validation_error": validation_error,
+            "schema_intent": intent,
+        }
+        response = WorkspaceClient().serving_endpoints.query(
+            endpoint,
+            messages=[
+                ChatMessage(
+                    role=ChatMessageRole.SYSTEM,
+                    content=_RELATIONSHIP_ENRICHMENT_PROMPT,
+                ),
+                ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
+            ],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        return _json_from_text(_response_text(response))
+    except Exception:
+        return None
+
+
+def _merge_model_relationship_contracts(
+    intent: dict[str, Any], enrichment: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge model-authored parent filters and only the columns needed to support them."""
+    merged = json.loads(json.dumps(intent))
+    relationships = merged.get("relationships")
+    updates = enrichment.get("relationships")
+    if isinstance(relationships, list) and isinstance(updates, list):
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            target = next(
+                (
+                    relationship
+                    for relationship in relationships
+                    if isinstance(relationship, dict)
+                    and (
+                        update.get("name") == relationship.get("name")
+                        or (
+                            update.get("parent_table") == relationship.get("parent_table")
+                            and update.get("child_table") == relationship.get("child_table")
+                            and update.get("parent_column")
+                            == relationship.get("parent_column")
+                            and update.get("child_column")
+                            == relationship.get("child_column")
+                        )
+                    )
+                ),
+                None,
+            )
+            if isinstance(target, dict):
+                if isinstance(update.get("parent_filter"), dict):
+                    target["parent_filter"] = update["parent_filter"]
+                if isinstance(update.get("constraints"), dict):
+                    target["constraints"] = update["constraints"]
+
+    tables = {
+        table.get("name"): table
+        for table in merged.get("table_specs", [])
+        if isinstance(table, dict)
+    }
+    columns = enrichment.get("columns")
+    if not isinstance(columns, list):
+        return merged
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        table = tables.get(column.get("table"))
+        name = column.get("name")
+        if not isinstance(table, dict) or not isinstance(name, str):
+            continue
+        existing = next(
+            (
+                item
+                for item in table.get("columns", [])
+                if isinstance(item, dict) and item.get("name") == name
+            ),
+            None,
+        )
+        model_column = {key: value for key, value in column.items() if key != "table"}
+        if isinstance(existing, dict):
+            existing.update(model_column)
+        elif model_column.get("type"):
+            table.setdefault("columns", []).append(model_column)
     return merged
 
 
@@ -3131,12 +3572,18 @@ columns that lack executable data generation strategies. Return exactly:
 "weights":[],"semantic":{}}]}
 
 Return one entry for every missing column in validation_error. Do not change columns
-that are not listed. Supply only relevant keys for each entry.
+that are not listed. When validation_error requires a column absent from the schema
+(for example a late-arrival ingestion timestamp), add exactly one entry with matching
+column and name fields, plus type and a complete generation strategy. Supply only
+relevant keys for each entry.
 
 Rules:
 - person name fields: faker "name"; person first/last names: matching Faker provider.
 - account_number/bank_account: faker "iban"; company/merchant names: faker "company".
 - categories, statuses, currencies, and labels: meaningful values, with weights when needed.
+- For an insurance prompt where province volume governs policies or claims, put the
+  requested Ontario/Quebec/Alberta/British Columbia weights on policies.province;
+  customer geography alone does not satisfy policy or claim volume.
 - independent date/timestamp: semantic {"kind":"timeline"}; dependent date:
   {"kind":"date_offset","base_column":"existing_column","min_days":0,"max_days":7}.
 - decimal money/score/measure: semantic log_normal, uniform_range, or normal with
@@ -3146,6 +3593,100 @@ Rules:
 - independent integer/long business measures: min_value and max_value, or a semantic rule.
 - values must be real domain values, never name_1/city_1/field_42 placeholders.
 Use the user prompt and existing schema names to choose realistic strategies.
+"""
+
+_ISSUE_ENRICHMENT_PROMPT = """
+You complete executable parameters for issue rules in a Scenario Data Factory schema.
+Return compact JSON only. Do not return tables, columns, relationships, commentary, or code.
+
+Input contains the user prompt, schema_intent, and a validation_error. Return exactly:
+{"issues":[{"issue_id":"optional","type":"...","table":"...","column":"...",
+"parameters":{},"correlation":{}}]}
+
+Return an entry only for issue rules whose parameters are missing or invalid according
+to validation_error. Do not change rates, counts, tables, columns, issue types, or
+the schema. Select only existing columns from the supplied schema_intent.
+
+Rules:
+- Every date_rule_violation requires parameters.after_column naming an existing column
+  on the same table. For a request such as "ship_date before order_date", use
+  column ship_date, after_column order_date, and days_after -1. For an ordinary
+  "must be on or after" rule, use the earlier/source date as after_column and
+  days_after -1 only when the requested defect must make the target date earlier.
+- late_arrival needs event_time_column and arrival_column when the schema has both;
+  use the actual business event timestamp and ingestion/arrival timestamp.
+- For a request that a specified share of a null-value issue is correlated, retain the
+  requested total null rate and return correlation {"share":...,"where":{...}} on
+  that same null_value issue. Do not create a second generic null issue.
+- schema_drift needs a concrete activation_batch and add_columns or another concrete
+  mutation using existing table context.
+- file_replay needs file_count, source_batch, and target_batch. Batches must be
+  valid for the requested timeline.
+Use the user's literal business rule to choose the parameters. Never invent a
+generic field name or replace the issue with prose.
+"""
+
+_OPERATIONAL_ENRICHMENT_PROMPT = """
+You complete one cross-cutting operational contract in a Scenario Data Factory schema.
+Return compact JSON only. Do not return tables, relationships, commentary, or code.
+
+Input contains the user prompt, schema_intent, and validation_error. Return exactly:
+{"columns":[{"table":"...","column":"...","type":"timestamp","semantic":{}}],
+"issues":[{"issue_id":"optional","type":"...","table":"...","column":"...",
+"parameters":{},"correlation":{}}]}
+
+Return entries only when validation_error requires them. A late-arrival defect is an
+event-versus-arrival contract, not a mutation of the event time. When a requested
+late-arrival issue lacks an arrival field, add a timestamp column with matching table
+and column fields plus semantic {"kind":"timeline"}; then patch the same issue.
+
+For a request such as "late_arrival on payments: 5%, delayed 1-7 days", return these
+exact executable fragments, adapting only names present in the schema:
+{"table":"payments","column":"ingestion_ts","type":"timestamp",
+"semantic":{"kind":"timeline"}}
+{"type":"late_arrival","table":"payments","column":"payment_date",
+"parameters":{"event_time_column":"payment_date","arrival_column":"ingestion_ts",
+"delay_days_min":1,"delay_days_max":7}}
+Do not put the rate inside parameters and do not return prose.
+"""
+
+_RELATIONSHIP_ENRICHMENT_PROMPT = """
+You complete relationship execution contracts for a Scenario Data Factory schema.
+Return compact JSON only. Do not return tables, issues, commentary, or code.
+
+Input contains the user prompt, schema_intent, and a validation_error. Return exactly:
+{"relationships":[{"name":"...","parent_filter":{"column":"...","values":["..."]},
+"constraints":{}}],
+"columns":[{"table":"...","name":"...","type":"string","values":["..."],
+"weights":[...]}]}
+
+Return only the relationships and parent-table columns needed to resolve a relationship
+validation error. Do not change table names, keys, row counts, issue rules, or data
+generation strategies unrelated to the error.
+
+Rules:
+- A relationship parent_filter must reference an existing column on its parent table.
+- Use relationship constraints to make temporal and aggregate business rules executable:
+  child_date_ranges uses child_column, parent_start_column, and parent_end_column;
+  aggregate_caps uses child_amount_column, parent_amount_column, and maximum_fraction.
+- When the prompt requires a child record to exist only for a subset of parent records,
+  such as returns only for delivered orders, retain that semantic restriction. Either
+  choose an existing meaningful parent status column or add the required parent column
+  with a complete realistic categorical strategy. Do not remove the parent_filter.
+- Any added string column must include real values (and weights when appropriate), not
+  generic placeholders. For delivered-order semantics, include "delivered" among the
+  possible values.
+- Relationship updates must match an existing relationship name exactly and columns
+  must match an existing parent table exactly.
+- For insurance validation errors, return the full executable patches rather than
+  prose. Use these exact JSON shapes, not shorthand arrays or maps:
+  {"name":"policies_claims","parent_filter":{"column":"status","values":["active"]},
+  "constraints":{"child_date_ranges":[{"child_column":"loss_date",
+  "parent_start_column":"effective_date","parent_end_column":"expiry_date"}]}}
+  {"name":"claims_payments","parent_filter":{"column":"claim_status",
+  "values":["approved","settled"]},"constraints":{"aggregate_caps":[{
+  "child_amount_column":"amount","parent_amount_column":"claim_amount",
+  "maximum_fraction":0.95}]}}
 """
 
 _CUSTOM_SCHEMA_SYSTEM_PROMPT = """
@@ -3202,6 +3743,12 @@ Column names must be unique within a table after lower_snake_case normalization.
 Foreign key columns must exist on child tables.
 Use relationship parent_filter {"column":"record_status","values":["delivered"]}
 when a child table must reference only a defined subset of parent records.
+Use relationship constraints for executable parent-child business rules. Supported forms are
+{"child_date_ranges":[{"child_column":"...","parent_start_column":"...",
+"parent_end_column":"..."}]} and {"aggregate_caps":[{"child_amount_column":"...",
+"parent_amount_column":"...","maximum_fraction":0.95}]}. Metadata records context only;
+every explicit statistic and business rule must also be encoded in executable columns,
+relationships, or issue parameters.
 Issues must reference existing tables and columns, except table-level issues.
 If the user supplies a count for a central fact/event table, preserve that count
 exactly and infer plausible counts for parent dimensions and downstream event tables.
@@ -3213,6 +3760,20 @@ Do not silently remap issue rules to another table.
 
 For healthcare claims, prefer tables like patients, providers, claims, adjudications,
 and payments when appropriate. Use patient_id/provider_id foreign keys on claims.
+For insurance claims with customers, policies, claims, and payments, encode literal
+anchors on the actual columns: policy_type values auto/home/tenant with the requested
+weights; claim_status weights whose closed plus settled share equals the request; and
+province weights where Ontario and Quebec exceed Alberta and British Columbia. For a
+material tail above a threshold, use log_normal semantic fields tail_share, tail_min,
+and tail_max in addition to median, sigma, and max. A valid policy-to-claim link must
+filter active policies and use child_date_ranges to make loss_date fall within
+effective_date and expiry_date. A payments link restricted to approved/settled claims
+must use parent_filter and aggregate_caps so total payment amount cannot exceed the
+parent claim amount. Late arrival means a separate event timestamp and ingestion
+timestamp: put event_time_column and arrival_column in issue parameters. For a request
+that half of a null-value issue is correlated, keep the requested total null rate and
+put correlation {"share":0.5,"where":{"source_system":"legacy_batch","after_batch":6}}
+on that null_value issue. Never place these requirements only in metadata.
 For telecom network events, prefer tables like customer_regions, cell_towers,
 network_engineers, network_events, incidents, and incident_closures when appropriate.
 For AI model operations and evaluation datasets, prefer tables like tenant_metadata,
@@ -3271,7 +3832,8 @@ Return shape:
       "parent_table": "patients",
       "parent_column": "patient_id",
       "child_table": "claims",
-      "child_column": "patient_id"
+      "child_column": "patient_id",
+      "constraints": {}
     }
   ],
   "issues": [
@@ -3323,6 +3885,10 @@ values plus weights for population/percentage distributions, semantic
 "returns only exist for delivered orders", add a meaningful delivered-status column
 to orders and put parent_filter {"column":"record_status","values":["delivered"]}
 on the orders-to-returns relationship. Do not leave these rules as metadata only.
+Every date_rule_violation must name an existing same-table comparison column in
+parameters.after_column. A requested defect of ship_date before order_date must be
+encoded as column ship_date, parameters {"after_column":"order_date",
+"days_after":-1}; do not omit either parameter.
 
 For a retail prompt mentioning population weighting, a 65/35 channel split,
 log-normal amounts, ordered shipping dates, and delivered-only returns, a compliant
@@ -3362,6 +3928,14 @@ Every non-key, non-foreign-key business field must be explicit: use timeline for
 independent dates, date_offset for dependent dates, a stated distribution for every
 decimal, numeric bounds/semantics for independent numeric measures, and real values,
 lookups, or Faker for strings. No field may rely on a generic compiler default.
+Treat validation errors about distributions, correlations, or relationship constraints
+as executable requirements. Metadata never satisfies them. For insurance claims,
+preserve policy_type weights, the combined closed/settled claim-status share, weighted
+province volumes, an explicit tail_share/tail_min/tail_max for a stated high-value tail,
+and a null_value correlation object when requested. Use relationship constraints
+child_date_ranges and aggregate_caps to enforce policy-date and payment-total rules.
+Late-arrival repairs must add a separate ingestion timestamp and name both the event
+and arrival columns in the issue parameters.
 For a financial-crime or banking schema inferred from a short prompt, use faker
 "name" for suspects.full_name (or equivalent person names), faker "iban" for
 accounts.account_number, meaningful categorical values for risk/status/type fields,

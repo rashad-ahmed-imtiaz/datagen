@@ -140,6 +140,7 @@ class RelationshipSpec(BaseModel):
     child_column: Identifier
     required: bool = True
     parent_filter: dict[str, Any] | None = None
+    constraints: dict[str, Any] | None = None
 
 
 class TimelineSpec(BaseModel):
@@ -227,6 +228,28 @@ class ScenarioSpec(BaseModel):
                     )
                 if not isinstance(filter_values, list) or not filter_values:
                     raise ValueError(f"relationship {rel.name} filter requires values")
+            constraints = rel.constraints or {}
+            for rule in constraints.get("child_date_ranges", []):
+                if not isinstance(rule, dict):
+                    raise ValueError(f"relationship {rel.name} has an invalid date-range rule")
+                if rule.get("child_column") not in tables[rel.child_table].column_names():
+                    raise ValueError(f"relationship {rel.name} date-range child column is missing")
+                for key in ("parent_start_column", "parent_end_column"):
+                    if rule.get(key) not in tables[rel.parent_table].column_names():
+                        raise ValueError(
+                            f"relationship {rel.name} date-range parent column is missing"
+                        )
+            for rule in constraints.get("aggregate_caps", []):
+                if not isinstance(rule, dict):
+                    raise ValueError(f"relationship {rel.name} has an invalid aggregate-cap rule")
+                if rule.get("child_amount_column") not in tables[rel.child_table].column_names():
+                    raise ValueError(
+                        f"relationship {rel.name} aggregate-cap child column is missing"
+                    )
+                if rule.get("parent_amount_column") not in tables[rel.parent_table].column_names():
+                    raise ValueError(
+                        f"relationship {rel.name} aggregate-cap parent column is missing"
+                    )
         for issue in self.issues:
             if issue.table not in tables:
                 raise ValueError(f"issue {issue.issue_id} references missing table {issue.table}")

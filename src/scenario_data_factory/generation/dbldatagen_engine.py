@@ -48,7 +48,8 @@ class DbldatagenEngine(BaselineGenerator):
                 df = self._apply_timeline(df, table, spec)
                 df = self._apply_agent_semantics(df, table, spec)
                 df = self._apply_relationships(df, table_name, spec, generated)
-                df = self._add_operational_columns(df, table)
+                df = self._apply_dependent_date_offsets(df, table)
+                df = self._add_operational_columns(df, table, spec)
                 generated[table_name] = df
             except Exception as exc:
                 raise DatagenCompilationError(
@@ -136,6 +137,21 @@ class DbldatagenEngine(BaselineGenerator):
                     F.lit(math.log(float(median))) + F.randn(spec.seed) * F.lit(float(sigma))
                 )
                 value = F.least(log_normal, F.lit(float(maximum)))
+                tail_share = semantic.get("tail_share")
+                tail_min = semantic.get("tail_min")
+                tail_max = semantic.get("tail_max", maximum)
+                if (
+                    isinstance(tail_share, (int, float))
+                    and isinstance(tail_min, (int, float))
+                    and isinstance(tail_max, (int, float))
+                    and 0 < tail_share < 1
+                    and 0 < tail_min <= tail_max
+                ):
+                    tail_value = F.lit(float(tail_min)) + F.rand(spec.seed + 1) * F.lit(
+                        float(tail_max) - float(tail_min)
+                    )
+                    is_tail = F.rand(spec.seed + 2) < F.lit(float(tail_share))
+                    value = F.when(is_tail, tail_value).otherwise(value)
                 scale = column.scale if column.scale is not None else 2
                 precision = column.precision if column.precision is not None else 12
                 df = df.withColumn(
@@ -195,6 +211,40 @@ class DbldatagenEngine(BaselineGenerator):
             df = df.withColumn(column.name, expression)
         return df
 
+    @staticmethod
+    def _apply_dependent_date_offsets(df: Any, table: Any) -> Any:
+        """Reapply child date offsets after a relationship rewrites their base dates."""
+        from pyspark.sql import functions as F
+
+        record_key = next(column.name for column in table.columns if column.primary_key)
+        for column in table.columns:
+            semantic = column.semantic or {}
+            if semantic.get("kind") != "date_offset":
+                continue
+            base_column = semantic.get("base_column")
+            min_days = semantic.get("min_days", 0)
+            max_days = semantic.get("max_days", min_days)
+            if (
+                base_column not in table.column_names()
+                or not isinstance(min_days, int)
+                or not isinstance(max_days, int)
+                or max_days < min_days
+            ):
+                continue
+            span = max_days - min_days + 1
+            offset = F.pmod(F.col(record_key), F.lit(span)).cast("int") + F.lit(min_days)
+            if column.type == "date":
+                df = df.withColumn(column.name, F.date_add(F.col(base_column), offset))
+            elif column.type == "timestamp":
+                df = df.withColumn(
+                    column.name,
+                    F.expr(
+                        f"timestampadd(DAY, {min_days} + pmod({record_key}, {span}), "
+                        f"{base_column})"
+                    ),
+                )
+        return df
+
     def _apply_relationships(
         self, df: Any, table_name: str, spec: ScenarioSpec, generated: dict[str, Any]
     ) -> Any:
@@ -207,21 +257,68 @@ class DbldatagenEngine(BaselineGenerator):
             child_pk = next(c.name for c in spec.table(table_name).columns if c.primary_key)
             parent_count = spec.table(rel.parent_table).row_count
             parent_filter = rel.parent_filter or {}
+            constraints = rel.constraints or {}
+            parent_columns = self._constraint_parent_columns(constraints)
             if parent_filter:
                 parent_column = parent_filter["column"]
                 filter_values = parent_filter["values"]
-                parent_keys = (
-                    generated[rel.parent_table]
-                    .where(F.col(parent_column).isin(filter_values))
-                    .select(F.col(rel.parent_column).alias("_sdf_parent_key"))
-                    .withColumn(
-                        "_sdf_relationship_slot",
-                        F.row_number().over(Window.orderBy("_sdf_parent_key")) - F.lit(1),
-                    )
+                parent_frame = generated[rel.parent_table].where(
+                    F.col(parent_column).isin(filter_values)
                 )
-                parent_count = parent_keys.count()
+                parent_count = parent_frame.count()
                 if parent_count == 0:
                     raise ValueError(f"relationship {rel.name} filter matched no parent rows")
+                bucket_count = min(64, max(1, parent_count // 10_000))
+                parent_keys = (
+                    parent_frame
+                    .select(
+                        F.col(rel.parent_column).alias("_sdf_parent_key"),
+                        *[
+                            F.col(column).alias(self._parent_alias(column))
+                            for column in parent_columns
+                        ],
+                    )
+                    .withColumn(
+                        "_sdf_parent_bucket",
+                        F.pmod(F.xxhash64(F.col("_sdf_parent_key")), F.lit(bucket_count)),
+                    )
+                )
+                bucket_sizes = {
+                    int(row["_sdf_parent_bucket"]): int(row["count"])
+                    for row in parent_keys.groupBy("_sdf_parent_bucket").count().collect()
+                }
+                offsets: dict[int, int] = {}
+                next_offset = 0
+                for bucket in sorted(bucket_sizes):
+                    offsets[bucket] = next_offset
+                    next_offset += bucket_sizes[bucket]
+                offset_map = F.create_map(
+                    *[
+                        item
+                        for bucket, offset in offsets.items()
+                        for item in (F.lit(bucket), F.lit(offset))
+                    ]
+                )
+                parent_keys = (
+                    parent_keys
+                    .withColumn(
+                        "_sdf_parent_rank",
+                        F.row_number().over(
+                            Window.partitionBy("_sdf_parent_bucket").orderBy("_sdf_parent_key")
+                        )
+                        - F.lit(1),
+                    )
+                    .withColumn(
+                        "_sdf_relationship_slot",
+                        F.element_at(offset_map, F.col("_sdf_parent_bucket"))
+                        + F.col("_sdf_parent_rank"),
+                    )
+                    .select(
+                        "_sdf_relationship_slot",
+                        "_sdf_parent_key",
+                        *[self._parent_alias(column) for column in parent_columns],
+                    )
+                )
                 df = (
                     df.drop(rel.child_column)
                     .withColumn(
@@ -232,19 +329,88 @@ class DbldatagenEngine(BaselineGenerator):
                     .drop("_sdf_relationship_slot")
                     .withColumnRenamed("_sdf_parent_key", rel.child_column)
                 )
-                continue
-            df = df.withColumn(
-                rel.child_column, ((F.col(child_pk) - F.lit(1)) % F.lit(parent_count)) + F.lit(1)
-            )
+            else:
+                df = df.withColumn(
+                    rel.child_column,
+                    ((F.col(child_pk) - F.lit(1)) % F.lit(parent_count)) + F.lit(1),
+                )
+                if parent_columns:
+                    parent_values = generated[rel.parent_table].select(
+                        F.col(rel.parent_column).alias("_sdf_parent_key"),
+                        *[
+                            F.col(column).alias(self._parent_alias(column))
+                            for column in parent_columns
+                        ],
+                    )
+                    df = (
+                        df.join(
+                            parent_values,
+                            F.col(rel.child_column) == F.col("_sdf_parent_key"),
+                            "left",
+                        )
+                        .drop("_sdf_parent_key")
+                    )
+            df = self._apply_relationship_constraints(df, rel, constraints, child_pk)
         return df
 
-    def _add_operational_columns(self, df: Any, table: Any) -> Any:
+    @staticmethod
+    def _constraint_parent_columns(constraints: dict[str, Any]) -> list[str]:
+        columns: list[str] = []
+        for rule in constraints.get("child_date_ranges", []):
+            if isinstance(rule, dict):
+                columns.extend(
+                    [str(rule.get("parent_start_column")), str(rule.get("parent_end_column"))]
+                )
+        for rule in constraints.get("aggregate_caps", []):
+            if isinstance(rule, dict):
+                columns.append(str(rule.get("parent_amount_column")))
+        return list(dict.fromkeys(column for column in columns if column and column != "None"))
+
+    @staticmethod
+    def _parent_alias(column: str) -> str:
+        return f"_sdf_parent_{column}"
+
+    def _apply_relationship_constraints(
+        self, df: Any, relationship: Any, constraints: dict[str, Any], child_pk: str
+    ) -> Any:
+        from pyspark.sql import functions as F
+        from pyspark.sql.window import Window
+
+        aliases: set[str] = set()
+        for rule in constraints.get("child_date_ranges", []):
+            if not isinstance(rule, dict):
+                continue
+            child_column = rule["child_column"]
+            start_alias = self._parent_alias(rule["parent_start_column"])
+            end_alias = self._parent_alias(rule["parent_end_column"])
+            aliases.update((start_alias, end_alias))
+            span = F.greatest(F.datediff(F.col(end_alias), F.col(start_alias)), F.lit(0))
+            offset = F.pmod(F.col(child_pk), span + F.lit(1)).cast("int")
+            df = df.withColumn(child_column, F.date_add(F.col(start_alias), offset))
+        for rule in constraints.get("aggregate_caps", []):
+            if not isinstance(rule, dict):
+                continue
+            child_column = rule["child_amount_column"]
+            parent_alias = self._parent_alias(rule["parent_amount_column"])
+            aliases.add(parent_alias)
+            maximum_fraction = float(rule.get("maximum_fraction", 1.0))
+            payments_per_parent = F.count(F.lit(1)).over(
+                Window.partitionBy(F.col(relationship.child_column))
+            )
+            cap = F.col(parent_alias) * F.lit(maximum_fraction) / payments_per_parent
+            df = df.withColumn(child_column, F.least(F.col(child_column), cap))
+        return df.drop(*aliases)
+
+    def _add_operational_columns(self, df: Any, table: Any, spec: ScenarioSpec) -> Any:
         from pyspark.sql import functions as F
 
         key = next(c.name for c in table.columns if c.primary_key)
         return (
             df.withColumn("_sdf_record_key", F.col(key).cast("long"))
-            .withColumn("batch_id", ((F.col(key) - F.lit(1)) % F.lit(30)) + F.lit(1))
+            .withColumn(
+                "batch_id",
+                F.pmod(F.col(key) - F.lit(1), F.lit(spec.timeline.batches)) + F.lit(1),
+            )
             .withColumn("_sdf_is_synthetic", F.lit(True))
         )
 
@@ -260,18 +426,22 @@ def _patch_dbldatagen_for_serverless_spark_connect(dg: Any) -> None:
     if getattr(data_generator, "_sdf_serverless_patch", False):
         return
     original_setup = data_generator._setupPandas
+    warned = False
 
     def safe_setup(self: Any, pandasBatchSize: int | None) -> None:
+        nonlocal warned
         try:
             original_setup(self, pandasBatchSize)
         except Exception as exc:
             message = str(exc)
             if "spark.sql.execution.arrow.enabled" not in message:
                 raise
-            self.logger.warning(
-                "Skipping dbldatagen Arrow config setup because Spark Connect "
-                "does not allow changing spark.sql.execution.arrow.enabled."
-            )
+            if not warned:
+                self.logger.warning(
+                    "Skipping dbldatagen Arrow config setup because Spark Connect "
+                    "does not allow changing spark.sql.execution.arrow.enabled."
+                )
+                warned = True
             self._batchSize = pandasBatchSize
 
     data_generator._setupPandas = safe_setup
