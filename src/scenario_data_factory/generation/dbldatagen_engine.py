@@ -439,7 +439,7 @@ class DbldatagenEngine(BaselineGenerator):
         from pyspark.sql import functions as F
 
         key = next(c.name for c in table.columns if c.primary_key)
-        return (
+        result = (
             df.withColumn("_sdf_record_key", F.col(key).cast("long"))
             .withColumn(
                 "batch_id",
@@ -447,6 +447,16 @@ class DbldatagenEngine(BaselineGenerator):
             )
             .withColumn("_sdf_is_synthetic", F.lit(True))
         )
+        if table.source_systems and "source_system" not in result.columns:
+            sources = F.array(*[F.lit(source) for source in table.source_systems])
+            result = result.withColumn(
+                "source_system",
+                F.element_at(
+                    sources,
+                    F.pmod(F.xxhash64(F.col(key)), F.lit(len(table.source_systems))) + F.lit(1),
+                ),
+            )
+        return result
 
 
 def dbldatagen_version() -> str:

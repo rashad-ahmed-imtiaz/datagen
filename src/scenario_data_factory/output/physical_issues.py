@@ -19,7 +19,9 @@ def apply_physical_raw_issues(
         elif issue_type == IssueType.SCHEMA_DRIFT:
             result[issue.table] = _apply_schema_drift(result[issue.table], issue.parameters)
         elif issue_type == IssueType.OUT_OF_ORDER:
-            result[issue.table] = _apply_out_of_order(result[issue.table], issue.parameters)
+            result[issue.table] = _apply_out_of_order(
+                result[issue.table], issue.issue_id, issue.parameters, plan.get(issue.table, [])
+            )
     return result
 
 
@@ -54,16 +56,22 @@ def _apply_schema_drift(df: Any, parameters: dict[str, Any]) -> Any:
     return drifted
 
 
-def _apply_out_of_order(df: Any, parameters: dict[str, Any]) -> Any:
+def _apply_out_of_order(
+    df: Any, issue_id: str, parameters: dict[str, Any], targets: list[IssueTarget]
+) -> Any:
     from pyspark.sql import functions as F
 
     source_batch = int(parameters.get("source_batch", 2))
     emitted_batch = int(parameters.get("emitted_batch", 1))
-    return df.withColumn(
-        "_sdf_emitted_batch_id",
-        F.when(F.col("batch_id") == source_batch, F.lit(emitted_batch)).otherwise(
-            F.col("batch_id")
-        ),
+    keys = [target.record_key for target in targets if target.issue_id == issue_id]
+    selected = (F.col("batch_id") == source_batch) & F.col("_sdf_record_key").isin(keys)
+    return (
+        df.withColumn(
+            "_sdf_original_batch_id",
+            F.when(selected, F.col("batch_id")).otherwise(F.lit(None)),
+        )
+        .withColumn("_sdf_emitted_batch_id", F.when(selected, F.lit(emitted_batch)))
+        .withColumn("batch_id", F.when(selected, F.lit(emitted_batch)).otherwise(F.col("batch_id")))
     )
 
 

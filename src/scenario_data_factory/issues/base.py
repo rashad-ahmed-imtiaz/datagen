@@ -73,6 +73,15 @@ class IssuePlugin:
                 "referential_orphan requires an integer or long foreign-key column.",
                 scenario_id=spec.scenario_id,
             )
+        if issue_type == IssueType.REFERENTIAL_ORPHAN and not any(
+            relationship.child_table == issue.table and relationship.child_column == issue.column
+            for relationship in spec.relationships
+        ):
+            raise IssuePlanningError(
+                "ISSUE_PARAMETER_INVALID",
+                "referential_orphan must target a declared relationship foreign key.",
+                scenario_id=spec.scenario_id,
+            )
         if issue_type == IssueType.DATE_RULE_VIOLATION:
             after_column = issue.parameters.get("after_column")
             after = columns.get(after_column) if isinstance(after_column, str) else None
@@ -91,6 +100,19 @@ class IssuePlugin:
                     ),
                     scenario_id=spec.scenario_id,
                 )
+            if after_column == issue.column:
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    "date_rule_violation after_column must differ from the target column.",
+                    scenario_id=spec.scenario_id,
+                )
+            days_after = issue.parameters.get("days_after", 1)
+            if not isinstance(days_after, int) or isinstance(days_after, bool):
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    "date_rule_violation days_after must be an integer.",
+                    scenario_id=spec.scenario_id,
+                )
         if issue_type == IssueType.LATE_ARRIVAL:
             arrival_column = issue.parameters.get("arrival_column") or issue.column
             arrival = columns.get(arrival_column) if isinstance(arrival_column, str) else None
@@ -98,6 +120,24 @@ class IssuePlugin:
                 raise IssuePlanningError(
                     "ISSUE_PARAMETER_INVALID",
                     "late_arrival requires arrival_column to reference a date or timestamp column.",
+                    scenario_id=spec.scenario_id,
+                )
+            default_delay = issue.parameters.get("delay_days", 1)
+            delay_min = issue.parameters.get("delay_days_min", default_delay)
+            delay_max = issue.parameters.get("delay_days_max", default_delay)
+            if (
+                not isinstance(delay_min, int)
+                or not isinstance(delay_max, int)
+                or isinstance(delay_min, bool)
+                or isinstance(delay_max, bool)
+                or not 0 <= delay_min <= delay_max
+            ):
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    (
+                        "late_arrival delay days must be non-negative integers with min no "
+                        "greater than max."
+                    ),
                     scenario_id=spec.scenario_id,
                 )
         if issue_type in {IssueType.FILE_REPLAY, IssueType.SCHEMA_DRIFT}:
@@ -119,6 +159,12 @@ class IssuePlugin:
         if issue_type == IssueType.FILE_REPLAY:
             source_batch = issue.parameters.get("source_batch")
             target_batch = issue.parameters.get("target_batch")
+            if not isinstance(source_batch, int) or not isinstance(target_batch, int):
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    "file_replay requires integer source_batch and target_batch parameters.",
+                    scenario_id=spec.scenario_id,
+                )
             if (
                 isinstance(source_batch, int)
                 and isinstance(target_batch, int)
@@ -127,6 +173,71 @@ class IssuePlugin:
                 raise IssuePlanningError(
                     "ISSUE_BATCH_INVALID",
                     "file_replay target_batch must be later than source_batch.",
+                    scenario_id=spec.scenario_id,
+                )
+            file_count = issue.parameters.get("file_count")
+            if file_count is not None and (
+                not isinstance(file_count, int) or isinstance(file_count, bool) or file_count < 1
+            ):
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    "file_replay file_count must be a positive integer.",
+                    scenario_id=spec.scenario_id,
+                )
+            if file_count not in {None, 1}:
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    (
+                        "file_replay currently writes one file per batch, so file_count "
+                        "must be 1. Use separate replay issues for separate source batches."
+                    ),
+                    scenario_id=spec.scenario_id,
+                )
+        if issue_type == IssueType.SCHEMA_DRIFT:
+            operation = issue.parameters.get("operation", "add_column")
+            add_columns = issue.parameters.get("add_columns")
+            activation_batch = issue.parameters.get("activation_batch")
+            if (
+                operation != "add_column"
+                or not isinstance(add_columns, list)
+                or not add_columns
+                or not isinstance(activation_batch, int)
+            ):
+                raise IssuePlanningError(
+                    "ISSUE_PARAMETER_INVALID",
+                    (
+                        "schema_drift currently requires operation=add_column and a non-empty "
+                        "add_columns list."
+                    ),
+                    scenario_id=spec.scenario_id,
+                )
+            known_types = {item.value for item in ColumnType}
+            for column in add_columns:
+                if (
+                    not isinstance(column, dict)
+                    or not isinstance(column.get("name"), str)
+                    or column["name"] in columns
+                    or column.get("type", "string") not in known_types
+                ):
+                    raise IssuePlanningError(
+                        "ISSUE_PARAMETER_INVALID",
+                        "schema_drift add_columns must define new columns with supported types.",
+                        scenario_id=spec.scenario_id,
+                    )
+        if issue_type == IssueType.OUT_OF_ORDER:
+            source_batch = issue.parameters.get("source_batch", 2)
+            emitted_batch = issue.parameters.get("emitted_batch", 1)
+            if (
+                not isinstance(source_batch, int)
+                or not isinstance(emitted_batch, int)
+                or not 1 <= emitted_batch < source_batch <= spec.timeline.batches
+            ):
+                raise IssuePlanningError(
+                    "ISSUE_BATCH_INVALID",
+                    (
+                        "out_of_order requires source_batch later than emitted_batch within "
+                        "the timeline."
+                    ),
                     scenario_id=spec.scenario_id,
                 )
         if issue_type in {IssueType.NULL_VALUE, IssueType.CORRELATED_MISSINGNESS}:

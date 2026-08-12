@@ -45,8 +45,13 @@ class ScenarioService:
         scenarios: ScenarioRepository | None = None,
         runs: RunRepository | None = None,
     ) -> None:
-        self.scenarios = scenarios or ScenarioRepository()
-        self.runs = runs or RunRepository()
+        control_root = os.getenv("SDF_CONTROL_VOLUME")
+        self.scenarios = scenarios or ScenarioRepository(
+            Path(control_root) / "drafts" if control_root else ".sdf/scenarios"
+        )
+        self.runs = runs or RunRepository(
+            Path(control_root) / "runs" if control_root else ".sdf/runs"
+        )
 
     def create_scenario_draft(self, input: dict[str, Any]) -> dict[str, object]:
         spec = get_blueprint(input.get("domain", "insurance_claims")).build(
@@ -98,6 +103,8 @@ class ScenarioService:
 
     def confirm_generation(self, run_id: str, confirmation_hash: str) -> dict[str, object]:
         run = self.runs.get(run_id)
+        if run["status"] in {"submitted", "running", "succeeded"}:
+            return run
         if confirmation_hash != run["spec_hash"]:
             return self.runs.update_status(run_id, "rejected", reason="confirmation hash mismatch")
         return self.runs.update_status(run_id, "confirmed")
@@ -109,6 +116,14 @@ class ScenarioService:
         if run["status"] != "confirmed":
             return run
         spec = self.scenarios.get(str(run["scenario_id"]))
+        if spec.spec_hash() != run["spec_hash"]:
+            return self.runs.update_status(
+                run_id,
+                "rejected",
+                reason=(
+                    "scenario changed after generation was prepared; prepare a new generation run"
+                ),
+            )
         try:
             spec_path = _write_databricks_scenario_spec(spec)
         except Exception as exc:
@@ -133,7 +148,9 @@ class ScenarioService:
                 job_parameters={"scenario_path": spec_path, "output_root": _raw_runs_root()},
                 idempotency_token=run_id,
             )
-            databricks_run_id = getattr(waiter, "run_id", None)
+            databricks_run_id = _databricks_run_id(waiter)
+            if databricks_run_id is None:
+                raise RuntimeError("Databricks accepted submission without returning a run ID")
             return self.runs.update_status(
                 run_id,
                 "submitted",
@@ -150,11 +167,44 @@ class ScenarioService:
             )
 
     def get_run_status(self, run_id: str) -> dict[str, object]:
-        run = self.runs.get(run_id)
+        run = self._refresh_run_status(run_id)
         return {"run_id": run_id, "status": run["status"]}
 
     def get_run_summary(self, run_id: str) -> dict[str, object]:
-        return self.runs.get(run_id)
+        return self._refresh_run_status(run_id)
+
+    def _refresh_run_status(self, run_id: str) -> dict[str, object]:
+        """Synchronize a submitted Databricks run without treating a read error as failure."""
+        run = self.runs.get(run_id)
+        if run.get("status") not in {"submitted", "running"}:
+            return run
+        databricks_run_id = run.get("databricks_run_id")
+        if not isinstance(databricks_run_id, int):
+            return run
+        state = _databricks_run_state(databricks_run_id)
+        if state is None:
+            return run
+        lifecycle_state, result_state = state
+        normalized_lifecycle = lifecycle_state.upper()
+        normalized_result = (result_state or "").upper()
+        if normalized_lifecycle in {"PENDING", "QUEUED"}:
+            status = "submitted"
+        elif normalized_lifecycle == "RUNNING":
+            status = "running"
+        elif normalized_lifecycle == "TERMINATED" and normalized_result == "SUCCESS":
+            status = "succeeded"
+        elif normalized_lifecycle in {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}:
+            status = "failed"
+        else:
+            return run
+        if status == run["status"]:
+            return run
+        return self.runs.update_status(
+            run_id,
+            status,
+            databricks_lifecycle_state=lifecycle_state,
+            databricks_result_state=result_state,
+        )
 
     def list_recent_scenarios(self, limit: int = 20) -> list[dict[str, object]]:
         return [_summary(spec, []) for spec in self.scenarios.list_recent(limit)]
@@ -256,6 +306,35 @@ def _issue_display_value(issue: IssueSpec) -> str:
     if issue.rate is not None:
         return str(issue.rate)
     return "-"
+
+
+def _databricks_run_state(run_id: int) -> tuple[str, str | None] | None:
+    """Return lifecycle/result state, or None when Databricks cannot be queried."""
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+
+        state = WorkspaceClient().jobs.get_run(run_id).state
+        lifecycle = _enum_text(getattr(state, "life_cycle_state", None))
+        if not lifecycle:
+            return None
+        return lifecycle, _enum_text(getattr(state, "result_state", None))
+    except Exception as exc:  # A temporary status-read failure must not falsify run state.
+        print(f"Could not refresh Databricks run {run_id}: {exc}")
+        return None
+
+
+def _databricks_run_id(waiter: object) -> int | None:
+    """Extract a run ID from either SDK response shape without waiting for completion."""
+    response = getattr(waiter, "response", waiter)
+    run_id = getattr(response, "run_id", None)
+    return run_id if isinstance(run_id, int) else None
+
+
+def _enum_text(value: object) -> str | None:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    return str(raw)
 
 
 def _spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
@@ -1006,7 +1085,7 @@ def _semantic_value_generation_gaps(spec: ScenarioSpec) -> list[str]:
             semantic = column.semantic or {}
             if column.type == ColumnType.STRING:
                 if column.faker:
-                    if column.faker not in _SUPPORTED_FAKER_PROVIDERS:
+                    if not _faker_provider_available(column.faker, spec.locale):
                         gaps.append(
                             f"{table.name}.{column.name} uses unsupported Faker provider "
                             f"{column.faker}"
@@ -1065,6 +1144,18 @@ def _semantic_value_generation_gaps(spec: ScenarioSpec) -> list[str]:
                     f"{table.name}.{column.name} needs a boolean value strategy"
                 )
     return gaps
+
+
+def _faker_provider_available(provider: str, locale: str) -> bool:
+    """Validate the model's provider against the installed locale-aware Faker surface."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", provider):
+        return False
+    try:
+        from faker import Faker
+
+        return callable(getattr(Faker(_normalized_locale(locale)), provider, None))
+    except Exception:
+        return False
 
 
 def _execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:

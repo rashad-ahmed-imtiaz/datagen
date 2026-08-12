@@ -32,8 +32,17 @@ def validate_scenario(spec: ScenarioSpec) -> list[str]:
             )
         plugin = ISSUE_REGISTRY[IssueType(issue.type)]
         plugin.validate(spec, issue)
-        if IssueType(issue.type) in RAW_REQUIRED and spec.outputs.mode == "delta":
-            warnings.append(
-                f"{issue.type} is a physical/raw-file issue; raw output should be enabled."
+        issue_type = IssueType(issue.type)
+        if issue_type in RAW_REQUIRED and spec.outputs.mode == "delta":
+            raise ScenarioValidationError(
+                "RAW_OUTPUT_REQUIRED",
+                f"{issue.type} requires raw output; output mode cannot be delta only.",
+                scenario_id=spec.scenario_id,
+            )
+        if issue_type == IssueType.SCHEMA_DRIFT and spec.outputs.raw_format != "json":
+            raise ScenarioValidationError(
+                "JSON_RAW_OUTPUT_REQUIRED",
+                "schema_drift requires JSON raw output so batches can have different fields.",
+                scenario_id=spec.scenario_id,
             )
     return warnings

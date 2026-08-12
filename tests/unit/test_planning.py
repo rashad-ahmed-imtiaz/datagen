@@ -9,7 +9,12 @@ from scenario_data_factory.compiler.validation import validate_scenario
 from scenario_data_factory.exceptions import ScenarioValidationError
 from scenario_data_factory.issues.planner import build_issue_plan, estimate_issues
 from scenario_data_factory.issues.registry import ISSUE_REGISTRY
-from scenario_data_factory.models.scenario import IssueType, RelationshipSpec
+from scenario_data_factory.models.scenario import (
+    IssueSpec,
+    IssueType,
+    RelationshipSpec,
+    ScenarioSpec,
+)
 
 
 def test_all_required_issue_types_are_registered() -> None:
@@ -29,6 +34,62 @@ def test_issue_targeting_is_deterministic() -> None:
     right = get_blueprint("insurance_claims").build(name="demo", seed=42, scale="small")
     right = right.model_copy(update={"scenario_id": left.scenario_id})
     assert build_issue_plan(left) == build_issue_plan(right)
+
+
+def test_column_targeted_issues_reserve_distinct_records() -> None:
+    spec = get_blueprint("insurance_claims").build(name="demo", seed=42, scale="small")
+    data = spec.model_dump(mode="json")
+    data["issues"] = [
+        IssueSpec(
+            issue_id="missing_one",
+            type=IssueType.NULL_VALUE,
+            table="claims",
+            column="adjuster_id",
+            exact_count=100,
+        ).model_dump(mode="json"),
+        IssueSpec(
+            issue_id="missing_two",
+            type=IssueType.BLANK_VALUE,
+            table="claims",
+            column="adjuster_id",
+            exact_count=100,
+        ).model_dump(mode="json"),
+    ]
+    plan = build_issue_plan(ScenarioSpec.model_validate(data))
+    targets = {target.issue_id: set() for target in plan["claims"]}
+    for target in plan["claims"]:
+        targets[target.issue_id].add(target.record_key)
+    assert targets["missing_one"].isdisjoint(targets["missing_two"])
+
+
+def test_record_level_issues_reserve_distinct_records_across_columns() -> None:
+    spec = get_blueprint("insurance_claims").build(name="demo", seed=42, scale="small")
+    data = spec.model_dump(mode="json")
+    data["issues"] = [
+        IssueSpec(
+            issue_id="duplicate",
+            type=IssueType.DUPLICATE_RECORD,
+            table="claims",
+            exact_count=4,
+        ).model_dump(mode="json"),
+        IssueSpec(
+            issue_id="missing_adjuster",
+            type=IssueType.NULL_VALUE,
+            table="claims",
+            column="adjuster_id",
+            exact_count=4,
+        ).model_dump(mode="json"),
+        IssueSpec(
+            issue_id="orphan_policy",
+            type=IssueType.REFERENTIAL_ORPHAN,
+            table="claims",
+            column="policy_id",
+            exact_count=4,
+        ).model_dump(mode="json"),
+    ]
+    plan = build_issue_plan(ScenarioSpec.model_validate(data))
+    keys = [target.record_key for target in plan["claims"]]
+    assert len(keys) == len(set(keys))
 
 
 def test_dependency_order_parents_before_children() -> None:
@@ -58,8 +119,8 @@ def test_raw_output_warning_for_physical_issues() -> None:
     spec = get_blueprint("insurance_claims").build(name="demo", seed=42, scale="small")
     data = spec.model_dump(mode="json")
     data["outputs"]["mode"] = "delta"
-    warnings = validate_scenario(type(spec).model_validate(data))
-    assert any("physical/raw-file issue" in warning for warning in warnings)
+    with pytest.raises(ScenarioValidationError, match="RAW_OUTPUT_REQUIRED"):
+        validate_scenario(type(spec).model_validate(data))
 
 
 def test_default_string_compilation_avoids_photon_format_path() -> None:

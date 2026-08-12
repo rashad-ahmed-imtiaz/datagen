@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Identifier = str
+_UC_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class LifecycleState(str, Enum):
@@ -75,7 +76,7 @@ class ColumnSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def valid_identifier(cls, value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        if len(value) > 128 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
             raise ValueError(f"invalid identifier: {value}")
         return value
 
@@ -94,10 +95,9 @@ class ColumnSpec(BaseModel):
         if self.weights is None:
             return self
         if not self.values or len(self.weights) != len(self.values):
-            self.weights = None
-            return self
+            raise ValueError("weights must align one-to-one with values")
         if any(weight <= 0 for weight in self.weights):
-            self.weights = None
+            raise ValueError("weights must be positive")
         return self
 
 
@@ -113,7 +113,7 @@ class TableSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def valid_identifier(cls, value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        if len(value) > 128 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
             raise ValueError(f"invalid table identifier: {value}")
         return value
 
@@ -122,8 +122,8 @@ class TableSpec(BaseModel):
         names = [c.name for c in self.columns]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate column in table {self.name}")
-        if not any(c.primary_key for c in self.columns):
-            raise ValueError(f"table {self.name} must define a primary key")
+        if sum(column.primary_key for column in self.columns) != 1:
+            raise ValueError(f"table {self.name} must define exactly one primary key")
         return self
 
     def column_names(self) -> set[str]:
@@ -166,6 +166,13 @@ class OutputSpec(BaseModel):
     raw_format: Literal["json", "csv"] = "json"
     manifest_detail: Literal["full", "summary"] = "full"
 
+    @field_validator("catalog", "schema_name", "clean_delta_prefix", "dirty_delta_prefix")
+    @classmethod
+    def valid_delta_identifier(cls, value: str | None) -> str | None:
+        if value is not None and not _UC_IDENTIFIER.fullmatch(value):
+            raise ValueError("catalog, schema, and Delta prefixes must be valid identifiers")
+        return value
+
 
 class IssueSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -193,8 +200,17 @@ class IssueSpec(BaseModel):
         }
         if self.type in column_required_types and not self.column:
             raise ValueError(f"{self.type.value} requires a target column")
-        if self.type == IssueType.FILE_REPLAY and self.parameters.get("file_count") is not None:
+        file_count = self.parameters.get("file_count")
+        if file_count is not None:
+            if self.type != IssueType.FILE_REPLAY:
+                raise ValueError("file_count is supported only by file_replay")
+            if self.rate is not None or self.exact_count is not None:
+                raise ValueError(
+                    "file_replay file_count cannot be combined with rate or exact_count"
+                )
             return self
+        if self.rate is not None and self.exact_count is not None:
+            raise ValueError("issue must define either rate or exact_count, not both")
         if self.rate is None and self.exact_count is None:
             raise ValueError("issue must define rate or exact_count")
         return self
@@ -217,11 +233,30 @@ class ScenarioSpec(BaseModel):
     outputs: OutputSpec = Field(default_factory=OutputSpec)
     metadata: dict[str, Any] = Field(default_factory=lambda: {"synthetic_data": True})
 
+    @field_validator("scenario_id")
+    @classmethod
+    def valid_scenario_id(cls, value: str) -> str:
+        if not re.fullmatch(r"scn_[A-Za-z0-9]+", value):
+            raise ValueError("scenario_id must use the scn_<alphanumeric> format")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def valid_scenario_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 120:
+            raise ValueError("scenario name must be between 1 and 120 characters")
+        return value
+
     @model_validator(mode="after")
     def validate_references(self) -> ScenarioSpec:
         tables = {t.name: t for t in self.tables}
         if len(tables) != len(self.tables):
             raise ValueError("duplicate table names")
+        issue_ids = [issue.issue_id for issue in self.issues]
+        if len(issue_ids) != len(set(issue_ids)):
+            raise ValueError("duplicate issue IDs")
+        relationship_targets: set[tuple[str, str]] = set()
         for rel in self.relationships:
             if rel.parent_table not in tables:
                 raise ValueError(f"relationship {rel.name} references missing parent table")
@@ -231,6 +266,24 @@ class ScenarioSpec(BaseModel):
                 raise ValueError(f"relationship {rel.name} references missing parent column")
             if rel.child_column not in tables[rel.child_table].column_names():
                 raise ValueError(f"relationship {rel.name} references missing child column")
+            parent_column = next(
+                column
+                for column in tables[rel.parent_table].columns
+                if column.name == rel.parent_column
+            )
+            child_column = next(
+                column
+                for column in tables[rel.child_table].columns
+                if column.name == rel.child_column
+            )
+            if parent_column.type != child_column.type:
+                raise ValueError(f"relationship {rel.name} key column types must match")
+            if not parent_column.primary_key:
+                raise ValueError(f"relationship {rel.name} parent column must be a primary key")
+            target = (rel.child_table, rel.child_column)
+            if target in relationship_targets:
+                raise ValueError("multiple relationships cannot populate the same child column")
+            relationship_targets.add(target)
             if rel.parent_filter:
                 filter_column = rel.parent_filter.get("column")
                 filter_values = rel.parent_filter.get("values")
@@ -240,6 +293,13 @@ class ScenarioSpec(BaseModel):
                     )
                 if not isinstance(filter_values, list) or not filter_values:
                     raise ValueError(f"relationship {rel.name} filter requires values")
+                filter_spec = next(
+                    column
+                    for column in tables[rel.parent_table].columns
+                    if column.name == filter_column
+                )
+                if filter_spec.values and not set(filter_values).intersection(filter_spec.values):
+                    raise ValueError(f"relationship {rel.name} filter cannot match parent values")
             constraints = rel.constraints or {}
             for rule in constraints.get("child_date_ranges", []):
                 if not isinstance(rule, dict):
@@ -251,6 +311,24 @@ class ScenarioSpec(BaseModel):
                         raise ValueError(
                             f"relationship {rel.name} date-range parent column is missing"
                         )
+                child = next(
+                    column
+                    for column in tables[rel.child_table].columns
+                    if column.name == rule["child_column"]
+                )
+                parent_types = {
+                    next(
+                        column
+                        for column in tables[rel.parent_table].columns
+                        if column.name == rule[key]
+                    ).type
+                    for key in ("parent_start_column", "parent_end_column")
+                }
+                temporal = {ColumnType.DATE, ColumnType.TIMESTAMP}
+                if child.type not in temporal or not parent_types.issubset(temporal):
+                    raise ValueError(f"relationship {rel.name} date-range columns must be temporal")
+                if len(parent_types) != 1 or child.type not in parent_types:
+                    raise ValueError(f"relationship {rel.name} date-range column types must match")
             for rule in constraints.get("aggregate_caps", []):
                 if not isinstance(rule, dict):
                     raise ValueError(f"relationship {rel.name} has an invalid aggregate-cap rule")
@@ -259,14 +337,40 @@ class ScenarioSpec(BaseModel):
                         f"relationship {rel.name} aggregate-cap child column is missing"
                     )
                 if rule.get("parent_amount_column") not in tables[rel.parent_table].column_names():
+                        raise ValueError(
+                            f"relationship {rel.name} aggregate-cap parent column is missing"
+                        )
+                child = next(
+                    column
+                    for column in tables[rel.child_table].columns
+                    if column.name == rule["child_amount_column"]
+                )
+                parent = next(
+                    column
+                    for column in tables[rel.parent_table].columns
+                    if column.name == rule["parent_amount_column"]
+                )
+                numeric = {ColumnType.INTEGER, ColumnType.LONG, ColumnType.DECIMAL}
+                if child.type not in numeric or parent.type not in numeric:
                     raise ValueError(
-                        f"relationship {rel.name} aggregate-cap parent column is missing"
+                        f"relationship {rel.name} aggregate-cap columns must be numeric"
+                    )
+                maximum_fraction = rule.get("maximum_fraction", 1.0)
+                if (
+                    not isinstance(maximum_fraction, (int, float))
+                    or isinstance(maximum_fraction, bool)
+                    or not 0 < maximum_fraction <= 1
+                ):
+                    raise ValueError(
+                        f"relationship {rel.name} aggregate cap must have fraction in (0, 1]"
                     )
         for issue in self.issues:
             if issue.table not in tables:
                 raise ValueError(f"issue {issue.issue_id} references missing table {issue.table}")
             if issue.column and issue.column not in tables[issue.table].column_names():
                 raise ValueError(f"issue {issue.issue_id} references missing column {issue.column}")
+            if issue.exact_count is not None and issue.exact_count > tables[issue.table].row_count:
+                raise ValueError(f"issue {issue.issue_id} exact_count exceeds table row count")
         if self.metadata.get("synthetic_data") is not True:
             raise ValueError("metadata.synthetic_data must be true")
         return self

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
 import scenario_data_factory.app_services.scenario_service as scenario_service
 from scenario_data_factory.app_services.scenario_service import (
     AgentPlanningError,
     ScenarioService,
+    _databricks_run_id,
+    _faker_provider_available,
     _json_from_text,
 )
 from scenario_data_factory.persistence.run_repository import RunRepository
@@ -95,6 +100,107 @@ def test_generation_confirmation_hash_guard(tmp_path) -> None:
     assert confirmed["status"] == "confirmed"
 
 
+def test_generation_rejects_a_scenario_changed_after_prepare(tmp_path) -> None:
+    service = _service(tmp_path)
+    draft = service.create_scenario_draft(
+        {"domain": "insurance_claims", "name": "demo", "seed": 42, "scale": "small"}
+    )
+    prepared = service.prepare_generation(str(draft["scenario_id"]))
+    service.patch_scenario_draft(
+        str(draft["scenario_id"]), int(draft["revision"]), {"name": "changed"}
+    )
+    result = service.confirm_and_submit_generation(
+        str(prepared["run_id"]), str(draft["spec_hash"])
+    )
+    assert result["status"] == "rejected"
+    assert "scenario changed" in str(result["reason"])
+
+
+def test_generation_status_refreshes_from_databricks(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path)
+    draft = service.create_scenario_draft(
+        {"domain": "insurance_claims", "name": "demo", "seed": 42, "scale": "small"}
+    )
+    prepared = service.prepare_generation(str(draft["scenario_id"]))
+    run_id = str(prepared["run_id"])
+    service.runs.update_status(run_id, "submitted", databricks_run_id=123)
+    monkeypatch.setattr(
+        scenario_service,
+        "_databricks_run_state",
+        lambda _: ("TERMINATED", "SUCCESS"),
+    )
+
+    assert service.get_run_status(run_id) == {"run_id": run_id, "status": "succeeded"}
+    assert service.get_run_summary(run_id)["databricks_result_state"] == "SUCCESS"
+
+
+def test_generation_status_preserves_submission_when_databricks_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path)
+    draft = service.create_scenario_draft(
+        {"domain": "insurance_claims", "name": "demo", "seed": 42, "scale": "small"}
+    )
+    prepared = service.prepare_generation(str(draft["scenario_id"]))
+    run_id = str(prepared["run_id"])
+    service.runs.update_status(run_id, "submitted", databricks_run_id=123)
+    monkeypatch.setattr(scenario_service, "_databricks_run_state", lambda _: None)
+
+    assert service.get_run_status(run_id) == {"run_id": run_id, "status": "submitted"}
+
+
+def test_generation_submission_persists_databricks_run_id(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path)
+    draft = service.create_scenario_draft(
+        {"domain": "insurance_claims", "name": "demo", "seed": 42, "scale": "small"}
+    )
+    prepared = service.prepare_generation(str(draft["scenario_id"]))
+    jobs = SimpleNamespace(
+        run_now=lambda *_args, **_kwargs: SimpleNamespace(response=SimpleNamespace(run_id=987))
+    )
+    sdk = ModuleType("databricks.sdk")
+    sdk.WorkspaceClient = lambda: SimpleNamespace(jobs=jobs)
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
+    monkeypatch.setenv("SDF_GENERATION_JOB_ID", "100")
+    monkeypatch.setattr(scenario_service, "_write_databricks_scenario_spec", lambda _: "/Volumes/x")
+
+    result = service.confirm_and_submit_generation(
+        str(prepared["run_id"]), str(draft["spec_hash"])
+    )
+
+    assert result["status"] == "submitted"
+    assert result["databricks_run_id"] == 987
+
+
+def test_generation_submission_without_a_run_id_is_marked_failed(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path)
+    draft = service.create_scenario_draft(
+        {"domain": "insurance_claims", "name": "demo", "seed": 42, "scale": "small"}
+    )
+    prepared = service.prepare_generation(str(draft["scenario_id"]))
+    sdk = ModuleType("databricks.sdk")
+    sdk.WorkspaceClient = lambda: SimpleNamespace(
+        jobs=SimpleNamespace(run_now=lambda *_args, **_kwargs: SimpleNamespace(response={}))
+    )
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
+    monkeypatch.setenv("SDF_GENERATION_JOB_ID", "100")
+    monkeypatch.setattr(scenario_service, "_write_databricks_scenario_spec", lambda _: "/Volumes/x")
+
+    result = service.confirm_and_submit_generation(
+        str(prepared["run_id"]), str(draft["spec_hash"])
+    )
+
+    assert result["status"] == "submit_failed"
+    assert "without returning a run ID" in str(result["reason"])
+
+
+def test_service_uses_control_volume_for_persistent_drafts(monkeypatch) -> None:
+    monkeypatch.setenv("SDF_CONTROL_VOLUME", "/Volumes/sdf/scenario_data_factory/sdf_control")
+    service = ScenarioService()
+    assert service.scenarios.root.as_posix().endswith("sdf_control/drafts")
+    assert service.runs.root.as_posix().endswith("sdf_control/runs")
+
+
 def test_agentic_draft_creates_an_executable_custom_scenario(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         scenario_service, "_custom_schema_intent_from_model", lambda _: _agent_intent()
@@ -166,3 +272,14 @@ def test_agentic_draft_rejects_missing_issue_column_before_submission(
 
 def test_truncated_model_json_returns_none() -> None:
     assert _json_from_text('{"table_specs": [') is None
+
+
+def test_locale_aware_faker_provider_validation_accepts_file_paths() -> None:
+    assert _faker_provider_available("file_path", "en_US")
+    assert not _faker_provider_available("__class__", "en_US")
+
+
+def test_databricks_submission_extracts_the_sdk_waiter_response_run_id() -> None:
+    assert _databricks_run_id(SimpleNamespace(response=SimpleNamespace(run_id=123))) == 123
+    assert _databricks_run_id(SimpleNamespace(run_id=456)) == 456
+    assert _databricks_run_id(SimpleNamespace(response=SimpleNamespace(run_id=None))) is None
