@@ -404,6 +404,14 @@ def _complete_agent_schema_contract(
         if spec is not None:
             return spec, assumptions, ""
 
+    if _needs_contextual_enrichment(current_error):
+        spec, assumptions = complete_with(
+            _enrich_contextual_issue_targets_with_model(prompt, current_intent, current_error),
+            _merge_model_contextual_issue_targets,
+        )
+        if spec is not None:
+            return spec, assumptions, ""
+
     if _needs_issue_enrichment(current_error):
         spec, assumptions = complete_with(
             _enrich_issue_parameters_with_model(prompt, current_intent, current_error),
@@ -588,6 +596,7 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
         *_semantic_value_generation_gaps(spec),
         *_execution_rule_gaps(spec, prompt),
         *_insurance_execution_rule_gaps(spec, prompt),
+        *_ai_model_ops_execution_rule_gaps(spec, prompt),
         *_custom_issue_gaps(spec, prompt),
         *_issue_parameter_reference_gaps(spec),
     ]
@@ -717,6 +726,10 @@ def _needs_column_enrichment(error: str) -> bool:
             "invalid semantic lookup",
         )
     )
+
+
+def _needs_contextual_enrichment(error: str) -> bool:
+    return "AI scenario" in error
 
 
 def _needs_operational_enrichment(error: str) -> bool:
@@ -943,6 +956,14 @@ def _normalize_agent_intent(intent: dict[str, Any]) -> dict[str, Any]:
             parameters.setdefault("delay_days_min", int(delay_range[0]))
             parameters.setdefault("delay_days_max", int(delay_range[1]))
 
+    for issue in normalized.get("issues", []):
+        if not isinstance(issue, dict) or issue.get("type") != IssueType.FILE_REPLAY.value:
+            continue
+        parameters = issue.get("parameters")
+        if isinstance(parameters, dict) and parameters.get("file_count") is not None:
+            issue["rate"] = None
+            issue["exact_count"] = None
+
     tables_by_name = {
         str(table.get("name")): table
         for table in normalized.get("table_specs", [])
@@ -1156,6 +1177,8 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
     gaps: list[str] = []
     mentioned_concepts = 0
     for concept, markers in concept_rules.items():
+        if concept == "customer" and "customer or tenant" in text:
+            continue
         if any(re.search(rf"\b{re.escape(marker)}\b", text) for marker in markers):
             mentioned_concepts += 1
             has_concept = any(
@@ -1174,7 +1197,15 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
             return gaps
     if mentioned_concepts >= 3 and len(spec.tables) < 4:
         gaps.append("multi-entity relational design")
-    if "event" in text and not any("event" in table.name for table in spec.tables):
+    if (
+        "event" in text
+        and not any("event" in table.name for table in spec.tables)
+        and not any(
+            token in table.name
+            for table in spec.tables
+            for token in ("inference", "transaction", "activity", "log")
+        )
+    ):
         gaps.append("event fact table")
     return gaps
 
@@ -1585,6 +1616,202 @@ def _insurance_execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]
     return gaps
 
 
+def _ai_model_ops_execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
+    """Keep AI platform defects on the operational records they are meant to test."""
+    text = prompt.lower()
+    ai_markers = (
+        "ai model",
+        "model operations",
+        "model inference",
+        "prompt request",
+        "evaluation result",
+    )
+    if not any(marker in text for marker in ai_markers):
+        return []
+
+    tables = {table.name: table for table in spec.tables}
+
+    def table(*names: str) -> TableSpec | None:
+        for name in names:
+            if name in tables:
+                return tables[name]
+        return None
+
+    def column_spec(target: TableSpec | None, column: str) -> ColumnSpec | None:
+        if target is None:
+            return None
+        columns = getattr(target, "columns", None)
+        if isinstance(columns, list):
+            return next((item for item in columns if item.name == column), None)
+        return None
+
+    def has_column(target: TableSpec | None, column: str) -> bool:
+        if column_spec(target, column) is not None:
+            return True
+        return target is not None and column in target.column_names()
+
+    def issue(
+        issue_type: IssueType, target: TableSpec | None, column: str | None = None
+    ) -> IssueSpec | None:
+        if target is None:
+            return None
+        return next(
+            (
+                item
+                for item in spec.issues
+                if IssueType(item.type) == issue_type
+                and item.table == target.name
+                and (column is None or item.column == column)
+            ),
+            None,
+        )
+
+    inference = table("model_inferences", "inferences")
+    prompts = table("prompt_requests", "prompts")
+    feedback = table("feedback_scores", "feedback")
+    evaluations = table("evaluation_results", "evaluations")
+    tenants = table("tenant_metadata", "tenants")
+    gaps: list[str] = []
+
+    def require_issue(
+        marker: str,
+        label: str,
+        issue_type: IssueType,
+        target: TableSpec | None,
+        column: str,
+    ) -> IssueSpec | None:
+        if marker not in text:
+            return None
+        if not has_column(target, column):
+            gaps.append(f"AI scenario needs {label} column")
+            return None
+        found = issue(issue_type, target, column)
+        if found is None:
+            gaps.append(f"AI scenario must map {label} to {target.name}.{column}")
+        return found
+
+    require_issue(
+        "orphan model", "orphan model IDs", IssueType.REFERENTIAL_ORPHAN, inference, "model_id"
+    )
+    require_issue(
+        "orphan user", "orphan user IDs", IssueType.REFERENTIAL_ORPHAN, inference, "user_id"
+    )
+    require_issue(
+        "missing prompt categor",
+        "missing prompt categories",
+        IssueType.NULL_VALUE,
+        prompts,
+        "prompt_category",
+    )
+    require_issue(
+        "missing evaluation label",
+        "missing evaluation labels",
+        IssueType.NULL_VALUE,
+        evaluations,
+        "evaluation_label",
+    )
+    require_issue(
+        "missing inference latency",
+        "missing inference latency",
+        IssueType.NULL_VALUE,
+        inference,
+        "response_latency_ms",
+    )
+    if "replayed inference" in text and issue(IssueType.FILE_REPLAY, inference) is None:
+        gaps.append("AI scenario must replay model_inferences ingestion files")
+    replay_causes_duplicates = "replay" in text and (
+        "duplicated inference" in text or "duplicate inference" in text
+    ) and "caused by" in text
+    if replay_causes_duplicates:
+        if issue(IssueType.FILE_REPLAY, inference) is None:
+            gaps.append("AI replay-caused inference duplicates need a file_replay rule")
+        if issue(IssueType.DUPLICATE_RECORD, inference) is not None:
+            gaps.append("AI replay-caused duplicates must not add duplicate_record")
+    if "schema drift" in text:
+        drift_issues = [
+            item for item in spec.issues if IssueType(item.type) == IssueType.SCHEMA_DRIFT
+        ]
+        if issue(IssueType.SCHEMA_DRIFT, inference) is None:
+            gaps.append("AI scenario must apply schema drift to model_inferences batches")
+        elif any(item.table != inference.name for item in drift_issues):
+            gaps.append("AI schema drift must not target an unrelated table")
+    invalid_model_version_marker = (
+        "invalid model version" if "invalid model version" in text else "invalid versions"
+    )
+    require_issue(
+        invalid_model_version_marker,
+        "invalid model versions",
+        IssueType.INVALID_VALUE,
+        inference,
+        "model_version",
+    )
+    require_issue(
+        "tenant region", "invalid tenant regions", IssueType.INVALID_VALUE, tenants, "region"
+    )
+
+    late_feedback = None
+    if "late-arriving feedback" in text or "late feedback" in text:
+        late_feedback = require_issue(
+            "feedback",
+            "late feedback events",
+            IssueType.LATE_ARRIVAL,
+            feedback,
+            "created_at",
+        )
+    if late_feedback is not None:
+        parameters = late_feedback.parameters
+        if (
+            parameters.get("event_time_column") != "created_at"
+            or not has_column(feedback, str(parameters.get("arrival_column", "")))
+        ):
+            gaps.append("AI late feedback needs created_at and a feedback ingestion timestamp")
+
+    if "feedback occurs before inference" in text or "feedback before inference" in text:
+        feedback_before_inference = issue(IssueType.DATE_RULE_VIOLATION, feedback, "created_at")
+        inference_created_at = column_spec(feedback, "inference_created_at")
+        if (
+            feedback_before_inference is None
+            or feedback_before_inference.parameters.get("after_column") != "inference_created_at"
+            or not has_column(feedback, "inference_created_at")
+            or (
+                inference_created_at is not None
+                and (inference_created_at.semantic or {}).get("kind")
+                not in {"timeline", "date_offset"}
+            )
+        ):
+            gaps.append("AI feedback-before-inference needs local feedback timestamp contract")
+
+    response_text_requested = "response_text" in text or "response text" in text
+    if response_text_requested and ("null" in text or "malformed" in text):
+        require_issue(
+            "malformed response_text",
+            "malformed response_text",
+            IssueType.INVALID_FORMAT,
+            inference,
+            "response_text",
+        )
+        if "null" in text:
+            require_issue(
+                "null",
+                "null response_text",
+                IssueType.NULL_VALUE,
+                inference,
+                "response_text",
+            )
+    require_issue(
+        "negative latency",
+        "negative latency",
+        IssueType.INVALID_VALUE,
+        inference,
+        "response_latency_ms",
+    )
+    if "empty prompt" in text:
+        require_issue(
+            "empty prompt", "empty prompt text", IssueType.BLANK_VALUE, prompts, "prompt_text"
+        )
+    return gaps
+
+
 def _custom_issue_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
     text = prompt.lower()
     issue_types = {IssueType(issue.type) for issue in spec.issues}
@@ -1608,6 +1835,13 @@ def _custom_issue_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
     }
     gaps = []
     for issue_type, markers in required.items():
+        if (
+            issue_type == IssueType.DUPLICATE_RECORD
+            and "replay" in text
+            and ("duplicated inference" in text or "duplicate inference" in text)
+            and "caused by" in text
+        ):
+            continue
         if any(marker in text for marker in markers) and issue_type not in issue_types:
             gaps.append(f"{issue_type.value} issue")
     return gaps
@@ -3710,6 +3944,108 @@ def _merge_model_issue_parameters(
     return merged
 
 
+def _enrich_contextual_issue_targets_with_model(
+    prompt: str, intent: dict[str, Any], validation_error: str
+) -> dict[str, Any] | None:
+    """Ask the agent for a small, domain-aware correction instead of a full redesign."""
+    endpoint = os.getenv("SDF_MODEL_ENDPOINT")
+    if not endpoint:
+        return None
+    try:  # pragma: no cover - exercised in Databricks App runtime
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        payload = {
+            "user_prompt": prompt,
+            "validation_error": validation_error,
+            "schema_intent": intent,
+        }
+        response = WorkspaceClient().serving_endpoints.query(
+            endpoint,
+            messages=[
+                ChatMessage(role=ChatMessageRole.SYSTEM, content=_CONTEXTUAL_ISSUE_PROMPT),
+                ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
+            ],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        return _json_from_text(_response_text(response))
+    except Exception:
+        return None
+
+
+def _merge_model_contextual_issue_targets(
+    intent: dict[str, Any], enrichment: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply the agent's explicit issue replacements and supporting column additions."""
+    merged = _merge_model_column_strategies(intent, enrichment)
+    entries = enrichment.get("issues")
+    issues = merged.get("issues")
+    if not isinstance(entries, list) or not isinstance(issues, list):
+        return merged
+
+    remove_ids = enrichment.get("remove_issue_ids")
+    if isinstance(remove_ids, list):
+        removable = {value for value in remove_ids if isinstance(value, str)}
+        issues[:] = [
+            item
+            for item in issues
+            if not isinstance(item, dict) or item.get("issue_id") not in removable
+        ]
+
+    valid_types = {issue_type.value for issue_type in IssueType}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") not in valid_types:
+            continue
+        replacement_id = entry.get("replaces_issue_id")
+        replacement_index = next(
+            (
+                index
+                for index, existing in enumerate(issues)
+                if isinstance(existing, dict)
+                and replacement_id
+                and existing.get("issue_id") == replacement_id
+            ),
+            None,
+        )
+        if replacement_index is None:
+            same_defect = [
+                index
+                for index, existing in enumerate(issues)
+                if isinstance(existing, dict)
+                and existing.get("type") == entry.get("type")
+                and existing.get("column") == entry.get("column")
+            ]
+            if len(same_defect) == 1:
+                replacement_index = same_defect[0]
+            elif entry.get("type") == IssueType.SCHEMA_DRIFT.value:
+                existing_drift = [
+                    index
+                    for index, existing in enumerate(issues)
+                    if isinstance(existing, dict)
+                    and existing.get("type") == IssueType.SCHEMA_DRIFT.value
+                ]
+                if len(existing_drift) == 1:
+                    replacement_index = existing_drift[0]
+        replacement = {
+            key: value
+            for key, value in entry.items()
+            if key not in {"replaces_issue_id", "issue_id"}
+        }
+        replacement.setdefault("parameters", {})
+        if replacement_index is not None:
+            previous = issues[replacement_index]
+            assert isinstance(previous, dict)
+            replacement["issue_id"] = entry.get("issue_id") or previous.get("issue_id")
+            issues[replacement_index] = replacement
+        else:
+            replacement["issue_id"] = entry.get("issue_id") or (
+                f"iss_agent_context_{len(issues) + 1:02d}"
+            )
+            issues.append(replacement)
+    return merged
+
+
 def _enrich_operational_contracts_with_model(
     prompt: str, intent: dict[str, Any], validation_error: str
 ) -> dict[str, Any] | None:
@@ -4112,6 +4448,46 @@ Rules:
 Use the user prompt and existing schema names to choose realistic strategies.
 """
 
+_CONTEXTUAL_ISSUE_PROMPT = """
+You are a Scenario Data Factory contextual-correction agent. Return compact JSON only.
+Do not return a complete schema, prose, markdown, or a deterministic template.
+
+Input contains user_prompt, validation_error, and a model-authored schema_intent. Correct only
+the columns and issue rules named by validation_error while preserving the model's tables,
+relationships, row counts, requested rates, and all unrelated fields.
+
+Return exactly:
+{"columns":[{"table":"...","name":"...","type":"timestamp","semantic":{}}],
+ "remove_issue_ids":["optional existing issue id"],
+ "issues":[{"replaces_issue_id":"optional existing issue id","type":"...",
+ "table":"...","column":"...","rate":0.01,"exact_count":null,"parameters":{}}]}
+
+For AI model operations, apply the semantic owner of each request literally:
+- model_inferences owns model_id, user_id, model_version, response_text,
+  response_latency_ms, replay, and schema-drift defects;
+- prompt_requests owns prompt_category and prompt_text;
+- feedback_scores or feedback owns late feedback and feedback-before-inference;
+- evaluation_results or evaluations owns evaluation_label;
+- tenant_metadata or tenants owns region.
+Replace an incorrectly targeted existing issue by setting replaces_issue_id. Preserve its exact
+rate/count unless the prompt specifies a different one. Add a new issue only when one distinct
+defect is absent. A table-level issue has column null.
+When the prompt says duplicate inference records are caused by replayed ingestion files, remove
+any duplicate_record rule for model_inferences and retain one file_replay rule as the only
+duplicate source. Put that removed rule's id in remove_issue_ids.
+
+When feedback-before-inference is requested, add feedback.inference_created_at as a timeline
+timestamp if absent, generate feedback.created_at as a date_offset from it with non-negative
+days, and make the intentional date_rule_violation use after_column=inference_created_at and
+days_after=-1. For late feedback, use created_at as event_time_column and an existing or added
+feedback ingestion timestamp as arrival_column. For a null or malformed response_text request,
+return both null_value and invalid_format issues on model_inferences.response_text. For schema
+drift, retain or provide executable batch and mutation parameters on model_inferences.
+
+Every added column needs a complete executable generation strategy. Do not add placeholder
+values or use an unrelated table merely because it has a similarly named field.
+"""
+
 _ISSUE_ENRICHMENT_PROMPT = """
 You complete executable parameters for issue rules in a Scenario Data Factory schema.
 Return compact JSON only. Do not return tables, columns, relationships, commentary, or code.
@@ -4416,6 +4792,15 @@ for them. Supported Faker providers are: address, bank_country, city, company, c
 credit_card_number, email, first_name, iban, job, last_name, name, paragraph, postcode,
 sentence, state, state_abbr, street_address, text, url, user_name, uuid4, and word.
 
+Final silent checklist for AI model operations prompts: model_inferences must carry model_id,
+user_id, model_version, response_text, and response_latency_ms even when prompt_requests also
+has identity fields. Map orphan model/user, invalid model version, latency, response-text,
+replay, and schema-drift defects to model_inferences. Map missing prompt category to
+prompt_requests; missing evaluation label to evaluation_results/evaluations; late feedback and
+feedback-before-inference to feedback_scores/feedback; and invalid tenant region to
+tenant_metadata/tenants. For "null or malformed response_text", create both null_value and
+invalid_format on model_inferences.response_text. Verify this mapping before emitting JSON.
+
 Supported issue types:
 null_value, blank_value, duplicate_record, invalid_format, invalid_value,
 referential_orphan, date_rule_violation, late_arrival, out_of_order,
@@ -4575,6 +4960,16 @@ For AI feedback-before-inference requests, feedback_scores must have local
 inference_created_at and created_at timestamps, with created_at generated as a
 date_offset from inference_created_at. The model_inferences-to-feedback_scores
 relationship must be a plain inference_id relationship without child_date_ranges.
+For AI model operations requests, keep defects on the operational entity named by
+the request: orphan model_id and user_id defects belong on model_inferences, not
+prompt_requests; missing prompt categories belong on prompt_requests; missing
+evaluation labels belong on evaluation_results; missing, negative, malformed, and
+invalid inference fields belong on model_inferences; late feedback belongs on
+feedback_scores/feedback with created_at and a separate ingestion timestamp; replay
+and schema-drift defects belong on model_inferences. Invalid tenant regions belong on
+tenant_metadata/tenants. Do not satisfy these requirements with the same issue type on
+an unrelated table. A request for null or malformed response_text needs both a
+null_value and an invalid_format rule on model_inferences.response_text.
 
 Allowed column types:
 string, integer, long, decimal, date, timestamp, boolean.

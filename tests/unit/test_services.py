@@ -9,9 +9,12 @@ import scenario_data_factory.app_services.scenario_service as scenario_service
 from scenario_data_factory.app_services.scenario_service import (
     AgentPlanningError,
     ScenarioService,
+    _ai_model_ops_execution_rule_gaps,
+    _custom_semantic_gaps,
     _databricks_run_id,
     _faker_provider_available,
     _json_from_text,
+    _merge_model_contextual_issue_targets,
     _normalize_agent_intent,
 )
 from scenario_data_factory.persistence.run_repository import RunRepository
@@ -381,6 +384,195 @@ def test_canadian_city_lookup_accepts_full_province_names() -> None:
     assert city["semantic"]["key_column"] == "province"
     assert city["semantic"]["values_by_key"]["Ontario"][0] == "Toronto"
     assert city["semantic"]["values_by_key"]["Quebec"][0] == "Montreal"
+
+
+def test_ai_model_ops_context_requires_issue_targets_on_operational_tables() -> None:
+    def table(name: str, *columns: str) -> SimpleNamespace:
+        return SimpleNamespace(name=name, column_names=lambda: set(columns))
+
+    def issue(
+        issue_type: str, table_name: str, column: str | None, parameters: dict | None = None
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            type=issue_type,
+            table=table_name,
+            column=column,
+            parameters=parameters or {},
+        )
+
+    prompt = """
+    Create AI model operations data with orphan model IDs, orphan user IDs, missing prompt
+    categories, missing evaluation labels, missing inference latency values, late-arriving
+    feedback, replayed inference files, schema drift, invalid model versions, invalid tenant
+    regions, feedback occurs before inference, null or malformed response_text, negative
+    latency, and empty prompt text.
+    """
+    tables = [
+        table(
+            "model_inferences",
+            "model_id",
+            "user_id",
+            "model_version",
+            "response_text",
+            "response_latency_ms",
+        ),
+        table("prompt_requests", "prompt_category", "prompt_text"),
+        table("feedback", "created_at", "inference_created_at", "ingestion_ts"),
+        table("evaluations", "evaluation_label"),
+        table("tenants", "region"),
+    ]
+    wrong = SimpleNamespace(
+        tables=tables,
+        issues=[
+            issue("referential_orphan", "prompt_requests", "model_id"),
+            issue("referential_orphan", "prompt_requests", "user_id"),
+            issue("invalid_value", "model_registry", "model_version"),
+            issue("schema_drift", "model_registry", None),
+            issue("file_replay", "prompt_requests", None),
+        ],
+    )
+
+    gaps = _ai_model_ops_execution_rule_gaps(wrong, prompt)
+
+    assert "AI scenario must map orphan model IDs to model_inferences.model_id" in gaps
+    assert "AI scenario must map orphan user IDs to model_inferences.user_id" in gaps
+    assert "AI scenario must map invalid model versions to model_inferences.model_version" in gaps
+    assert "AI scenario must replay model_inferences ingestion files" in gaps
+    assert "AI scenario must apply schema drift to model_inferences batches" in gaps
+
+    correct = SimpleNamespace(
+        tables=tables,
+        issues=[
+            issue("referential_orphan", "model_inferences", "model_id"),
+            issue("referential_orphan", "model_inferences", "user_id"),
+            issue("null_value", "prompt_requests", "prompt_category"),
+            issue("null_value", "evaluations", "evaluation_label"),
+            issue("null_value", "model_inferences", "response_latency_ms"),
+            issue(
+                "late_arrival",
+                "feedback",
+                "created_at",
+                {"event_time_column": "created_at", "arrival_column": "ingestion_ts"},
+            ),
+            issue("file_replay", "model_inferences", None),
+            issue("schema_drift", "model_inferences", None),
+            issue("invalid_value", "model_inferences", "model_version"),
+            issue("invalid_value", "tenants", "region"),
+            issue(
+                "date_rule_violation",
+                "feedback",
+                "created_at",
+                {"after_column": "inference_created_at"},
+            ),
+            issue("invalid_format", "model_inferences", "response_text"),
+            issue("null_value", "model_inferences", "response_text"),
+            issue("invalid_value", "model_inferences", "response_latency_ms"),
+            issue("blank_value", "prompt_requests", "prompt_text"),
+        ],
+    )
+
+    assert _ai_model_ops_execution_rule_gaps(correct, prompt) == []
+
+
+def test_contextual_issue_merge_replaces_wrong_target_and_adds_missing_defect() -> None:
+    intent = {
+        "table_specs": [
+            {
+                "name": "model_inferences",
+                "row_count": 10,
+                "columns": [
+                    {
+                        "name": "inference_id",
+                        "type": "long",
+                        "primary_key": True,
+                        "nullable": False,
+                    }
+                ],
+            }
+        ],
+        "issues": [
+            {
+                "issue_id": "wrong_model_version",
+                "type": "invalid_value",
+                "table": "model_registry",
+                "column": "model_version",
+                "rate": 0.01,
+                "parameters": {},
+            },
+            {
+                "issue_id": "replay_duplicate_overlap",
+                "type": "duplicate_record",
+                "table": "model_inferences",
+                "column": None,
+                "rate": 0.1,
+                "parameters": {},
+            },
+        ],
+    }
+    enrichment = {
+        "remove_issue_ids": ["replay_duplicate_overlap"],
+        "columns": [
+            {
+                "table": "model_inferences",
+                "name": "model_version",
+                "type": "string",
+                "values": ["1.0.0", "1.1.0"],
+            }
+        ],
+        "issues": [
+            {
+                "replaces_issue_id": "wrong_model_version",
+                "type": "invalid_value",
+                "table": "model_inferences",
+                "column": "model_version",
+                "rate": 0.01,
+                "parameters": {"invalid_values": ["version_unknown"]},
+            },
+            {
+                "type": "null_value",
+                "table": "model_inferences",
+                "column": "response_text",
+                "rate": 0.01,
+                "parameters": {},
+            },
+        ],
+    }
+
+    merged = _merge_model_contextual_issue_targets(intent, enrichment)
+
+    assert merged["issues"][0]["issue_id"] == "wrong_model_version"
+    assert merged["issues"][0]["table"] == "model_inferences"
+    assert merged["issues"][1]["column"] == "response_text"
+    assert len(merged["issues"]) == 2
+    assert any(
+        column["name"] == "model_version"
+        for column in merged["table_specs"][0]["columns"]
+    )
+
+
+def test_normalization_clears_rate_when_file_replay_uses_file_count() -> None:
+    intent = _agent_intent()
+    intent["issues"] = [
+        {
+            "type": "file_replay",
+            "table": "orders",
+            "rate": 0.1,
+            "parameters": {"file_count": 1, "source_batch": 2, "target_batch": 4},
+        }
+    ]
+
+    normalized = _normalize_agent_intent(intent)
+
+    assert normalized["issues"][0]["rate"] is None
+    assert normalized["issues"][0]["exact_count"] is None
+
+
+def test_ai_inferences_satisfy_event_fact_concept_without_generic_event_table() -> None:
+    spec = SimpleNamespace(
+        tables=[SimpleNamespace(name="model_inferences", columns=[])], relationships=[]
+    )
+
+    assert _custom_semantic_gaps(spec, "AI model inference events") == []
 
 
 def test_databricks_submission_extracts_the_sdk_waiter_response_run_id() -> None:
