@@ -9,3 +9,4 @@ __pycache__/
 .sdf/
 out/
 .tmp_raw_events*/
+.agent_banking_test*/
