@@ -94,6 +94,17 @@ async def create_scenario_from_prompt(request: PromptDraftRequest) -> dict[str, 
                 "No data or tables were created; please submit the request again."
             ),
         ) from exc
+    except Exception as exc:
+        # Keep infrastructure faults in the server log while never returning a raw
+        # ASGI 500 page to a user who only submitted a scenario request.
+        print("Unexpected scenario draft failure:", repr(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The scenario draft could not be completed or stored. "
+                "No data or tables were created; please submit the request again."
+            ),
+        ) from exc
 
 
 @app.post("/api/scenarios")

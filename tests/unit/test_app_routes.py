@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+import app.main as main
 from app.main import app
 
 
@@ -33,3 +34,16 @@ def test_missing_run_is_a_clean_not_found_response() -> None:
     response = TestClient(app).get("/api/runs/run_missing")
     assert response.status_code == 404
     assert response.json()["detail"] == "scenario or run not found"
+
+
+def test_agent_draft_infrastructure_failure_is_a_clean_service_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.service,
+        "create_scenario_from_prompt",
+        lambda _: (_ for _ in ()).throw(RuntimeError("volume unavailable")),
+    )
+
+    response = TestClient(app).post("/api/agent/draft", json={"prompt": "Generate banking data."})
+
+    assert response.status_code == 503
+    assert "could not be completed or stored" in response.json()["detail"]

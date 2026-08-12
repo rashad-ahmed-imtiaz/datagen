@@ -32,8 +32,9 @@ class AgentPlanningError(ValueError):
     """Raised only after the model planner exhausts its internal recovery attempts."""
 
 
-_MAX_SCHEMA_DESIGN_ATTEMPTS = 1
+_MAX_SCHEMA_DESIGN_ATTEMPTS = 2
 _MAX_SCHEMA_REPAIR_ATTEMPTS = 2
+_MAX_COLUMN_COMPLETION_ATTEMPTS = 2
 _SCHEMA_DESIGN_MAX_TOKENS = 8000
 _COMPLEX_SCHEMA_DESIGN_MAX_TOKENS = 12000
 _BASIC_SCHEMA_DESIGN_MAX_TOKENS = 4500
@@ -377,18 +378,55 @@ def _complete_agent_schema_contract(
     except Exception as exc:
         current_error = str(exc)
 
-    # Most first-pass drafts only lack executable column strategies. A compact
-    # completion avoids asking the model to regenerate the entire schema.
-    enrichment = _enrich_column_strategies_with_model(prompt, current_intent, current_error)
-    if enrichment:
-        current_intent = _normalize_agent_intent(
-            _merge_model_column_strategies(current_intent, enrichment)
-        )
+    def complete_with(
+        enrichment: dict[str, Any] | None, merge
+    ) -> tuple[ScenarioSpec | None, list[str]]:
+        nonlocal current_intent, current_error
+        if not enrichment:
+            return None, []
+        current_intent = _normalize_agent_intent(merge(current_intent, enrichment))
         try:
-            spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
-            return spec, assumptions, ""
+            return _custom_spec_from_intent(current_intent, prompt)
         except Exception as exc:
             current_error = str(exc)
+            return None, []
+
+    # Prefer focused model completions to a full-schema retry. Each completion has a
+    # narrow contract, so it preserves the original domain design while filling in
+    # only the execution details that validation identified as incomplete.
+    for _ in range(_MAX_COLUMN_COMPLETION_ATTEMPTS):
+        if not _needs_column_enrichment(current_error):
+            break
+        spec, assumptions = complete_with(
+            _enrich_column_strategies_with_model(prompt, current_intent, current_error),
+            _merge_model_column_strategies,
+        )
+        if spec is not None:
+            return spec, assumptions, ""
+
+    if _needs_issue_enrichment(current_error):
+        spec, assumptions = complete_with(
+            _enrich_issue_parameters_with_model(prompt, current_intent, current_error),
+            _merge_model_issue_parameters,
+        )
+        if spec is not None:
+            return spec, assumptions, ""
+
+    if _needs_operational_enrichment(current_error):
+        spec, assumptions = complete_with(
+            _enrich_operational_contracts_with_model(prompt, current_intent, current_error),
+            _merge_model_operational_contracts,
+        )
+        if spec is not None:
+            return spec, assumptions, ""
+
+    if _needs_relationship_enrichment(current_error):
+        spec, assumptions = complete_with(
+            _enrich_relationship_contracts_with_model(prompt, current_intent, current_error),
+            _merge_model_relationship_contracts,
+        )
+        if spec is not None:
+            return spec, assumptions, ""
 
     # Bounded full repairs handle structural defects the focused completion cannot express.
     for _ in range(_MAX_SCHEMA_REPAIR_ATTEMPTS):
@@ -556,6 +594,10 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
     if semantic_gaps:
         raise ValueError(f"custom ScenarioSpec missed requested intent: {', '.join(semantic_gaps)}")
     spec = _ensure_timeline_supports_issue_batches(spec)
+    # The typed model validates references, but issue plugins enforce executable
+    # injection parameters. Preflight here so an agent draft cannot be saved and
+    # later fail only when previewing or generating.
+    validate_scenario(spec)
     return spec, [
         "Agent created a custom schema because the request was not limited to a known blueprint.",
         (
@@ -642,6 +684,8 @@ def _column_weights_from_intent(column: dict[str, Any]) -> object:
         if (
             isinstance(values, list)
             and isinstance(weights, list)
+            and values
+            and weights
             and len(values) == len(weights)
             and all(isinstance(weight, (int, float)) and weight > 0 for weight in weights)
         ):
@@ -655,6 +699,45 @@ def _column_weights_from_intent(column: dict[str, Any]) -> object:
     if not all(isinstance(weight, (int, float)) and weight > 0 for weight in weights):
         return None
     return weights
+
+
+def _needs_issue_enrichment(error: str) -> bool:
+    return any(issue_type.value in error for issue_type in IssueType) or " correlation" in error
+
+
+def _needs_column_enrichment(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in (
+            "needs values",
+            "needs a timeline",
+            "needs a numeric",
+            "needs a boolean",
+            "unsupported Faker provider",
+            "invalid semantic lookup",
+        )
+    )
+
+
+def _needs_operational_enrichment(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in (
+            "late_arrival",
+            "file_replay",
+            "schema_drift",
+            "out_of_order",
+            "arrival_column",
+            "date_rule_violation",
+        )
+    )
+
+
+def _needs_relationship_enrichment(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in ("relationship", "parent_filter", "child_date_ranges", "aggregate_caps")
+    )
 
 
 def _normalize_repaired_intent(
@@ -725,6 +808,20 @@ def _normalize_agent_intent(intent: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(column, dict):
                 continue
             column_name = str(column.get("name") or "").lower()
+            values = column.get("values")
+            weights = column.get("weights")
+            if weights is not None and not (
+                isinstance(values, list)
+                and values
+                and isinstance(weights, list)
+                and weights
+                and len(values) == len(weights)
+                and all(isinstance(weight, (int, float)) and weight > 0 for weight in weights)
+            ):
+                # Models often emit weights: [] as an empty optional field. It has
+                # no distribution meaning and must not invalidate an otherwise
+                # executable column. Real weighted anchors are still verified later.
+                column.pop("weights", None)
             if (
                 column.get("type") == ColumnType.STRING.value
                 and not column.get("primary_key")
@@ -1203,6 +1300,38 @@ def _execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
         parent_filter = relation.parent_filter if relation else None
         if not parent_filter or "delivered" not in parent_filter.get("values", []):
             gaps.append("orders-to-returns delivered-order relationship filter")
+    if "appointment is scheduled before its encounter" in text or (
+        "encounter dates before appointment dates" in text
+    ):
+        encounter_date = column("encounters", "encounter_date")
+        local_appointment_date = column("encounters", "appointment_date")
+        semantic = encounter_date.semantic if encounter_date else {}
+        if (
+            not local_appointment_date
+            or (local_appointment_date.semantic or {}).get("kind")
+            not in {"timeline", "date_offset"}
+            or not isinstance(semantic, dict)
+            or semantic.get("kind") != "date_offset"
+            or semantic.get("base_column") != "appointment_date"
+            or semantic.get("min_days", -1) < 0
+        ):
+            gaps.append("non-negative encounters.encounter_date offset from appointment_date")
+        date_issue = next(
+            (
+                issue
+                for issue in spec.issues
+                if IssueType(issue.type) == IssueType.DATE_RULE_VIOLATION
+                and issue.table == "encounters"
+                and issue.column == "encounter_date"
+            ),
+            None,
+        )
+        if (
+            not date_issue
+            or date_issue.parameters.get("after_column") != "appointment_date"
+            or date_issue.parameters.get("days_after") != -1
+        ):
+            gaps.append("encounters encounter-before-appointment date-rule violation")
     return gaps
 
 
@@ -3470,6 +3599,12 @@ def _merge_model_issue_parameters(
                 parameters = target.setdefault("parameters", {})
                 if isinstance(parameters, dict):
                     parameters.update(entry["parameters"])
+                    if (
+                        target.get("type") == IssueType.FILE_REPLAY.value
+                        and parameters.get("file_count") is not None
+                    ):
+                        target["rate"] = None
+                        target["exact_count"] = None
             if isinstance(entry.get("correlation"), dict):
                 target["correlation"] = entry["correlation"]
         elif (
@@ -3958,6 +4093,15 @@ exact executable fragments, adapting only names present in the schema:
 "parameters":{"event_time_column":"payment_date","arrival_column":"ingestion_ts",
 "delay_days_min":1,"delay_days_max":7}}
 Do not put the rate inside parameters and do not return prose.
+
+For a date_rule_violation whose comparison column is absent from the affected table,
+add a same-table comparison timestamp/date and patch the issue. For an appointment
+before encounter defect on encounters, add encounters.appointment_date with semantic
+{"kind":"timeline"}, update encounters.encounter_date to semantic
+{"kind":"date_offset","base_column":"appointment_date","min_days":0,"max_days":7},
+and set the issue parameters to {"after_column":"appointment_date","days_after":-1}.
+The comparison column and target must be on the same table; do not point at a parent
+table's column.
 """
 
 _RELATIONSHIP_ENRICHMENT_PROMPT = """

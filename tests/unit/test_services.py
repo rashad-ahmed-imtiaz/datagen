@@ -227,6 +227,53 @@ def test_agentic_draft_uses_model_completion_for_missing_strategy(tmp_path, monk
     assert result["tables"] == {"customers": 100, "orders": 300}
 
 
+def test_agentic_draft_ignores_empty_optional_model_weights(tmp_path, monkeypatch) -> None:
+    intent = _agent_intent()
+    tables = intent["table_specs"]
+    assert isinstance(tables, list)
+    columns = tables[0]["columns"]
+    assert isinstance(columns, list)
+    columns[1]["weights"] = []
+    monkeypatch.setattr(scenario_service, "_custom_schema_intent_from_model", lambda _: intent)
+
+    result = _service(tmp_path).create_scenario_from_prompt("Create customer orders data.")
+
+    assert result["tables"] == {"customers": 100, "orders": 300}
+
+
+def test_agentic_draft_uses_focused_issue_completion(tmp_path, monkeypatch) -> None:
+    intent = _agent_intent()
+    intent["issues"] = [
+        {
+            "issue_id": "replay_orders",
+            "type": "file_replay",
+            "table": "orders",
+            "exact_count": 1,
+            "parameters": {"source_batch": 12, "target_batch": 10},
+        }
+    ]
+    monkeypatch.setattr(scenario_service, "_custom_schema_intent_from_model", lambda _: intent)
+    monkeypatch.setattr(scenario_service, "_enrich_column_strategies_with_model", lambda *_: None)
+    monkeypatch.setattr(
+        scenario_service,
+        "_enrich_issue_parameters_with_model",
+        lambda *_: {
+            "issues": [
+                {
+                "issue_id": "replay_orders",
+                "type": "file_replay",
+                "table": "orders",
+                "parameters": {"source_batch": 2, "target_batch": 4, "file_count": 1},
+                }
+            ]
+        },
+    )
+
+    result = _service(tmp_path).create_scenario_from_prompt("Create customer orders data.")
+
+    assert result["issues"][0]["display_value"] == "1 file"
+
+
 def test_agentic_draft_rejects_no_model_plan_without_deterministic_fallback(
     tmp_path, monkeypatch
 ) -> None:
