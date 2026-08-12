@@ -66,5 +66,5 @@ def test_default_string_compilation_avoids_photon_format_path() -> None:
     spec = get_blueprint("insurance_claims").build(name="demo", seed=42, scale="small")
     compiled = compile_table(spec.table("customers"))
     first_name = next(column for column in compiled.columns if column.name == "first_name")
-    assert "expr" in first_name.options
+    assert first_name.options["faker"] == "first_name"
     assert "format" not in first_name.options

@@ -1,0 +1,138 @@
+name: All Issue Types Smoke Scenario
+domain: integration_smoke
+seed: 42
+locale: en_US
+timeline:
+  start_date: 2025-01-01
+  batches: 3
+  frequency: monthly
+tables:
+  - name: parents
+    row_count: 20
+    columns:
+      - name: parent_id
+        type: long
+        primary_key: true
+        nullable: false
+  - name: events
+    row_count: 90
+    source_systems: [api, legacy_batch]
+    columns:
+      - name: event_id
+        type: long
+        primary_key: true
+        nullable: false
+      - name: parent_id
+        type: long
+        nullable: false
+      - name: source_system
+        type: string
+        values: [api, legacy_batch]
+        weights: [8, 2]
+      - name: description
+        type: string
+        faker: sentence
+      - name: event_date
+        type: date
+        semantic:
+          kind: timeline
+      - name: completion_date
+        type: date
+        semantic:
+          kind: date_offset
+          base_column: event_date
+          min_days: 1
+          max_days: 3
+      - name: ingestion_ts
+        type: timestamp
+        semantic:
+          kind: timeline
+relationships:
+  - name: parents_events
+    parent_table: parents
+    parent_column: parent_id
+    child_table: events
+    child_column: parent_id
+issues:
+  - issue_id: null_description
+    type: null_value
+    table: events
+    column: description
+    exact_count: 2
+  - issue_id: blank_description
+    type: blank_value
+    table: events
+    column: description
+    exact_count: 2
+  - issue_id: duplicate_events
+    type: duplicate_record
+    table: events
+    exact_count: 2
+  - issue_id: invalid_description_format
+    type: invalid_format
+    table: events
+    column: description
+    exact_count: 2
+  - issue_id: invalid_description_value
+    type: invalid_value
+    table: events
+    column: description
+    exact_count: 2
+    parameters:
+      value: INVALID_EVENT_DESCRIPTION
+  - issue_id: orphan_parent
+    type: referential_orphan
+    table: events
+    column: parent_id
+    exact_count: 2
+  - issue_id: invalid_completion_date
+    type: date_rule_violation
+    table: events
+    column: completion_date
+    exact_count: 2
+    parameters:
+      after_column: event_date
+      days_after: -1
+  - issue_id: late_ingestion
+    type: late_arrival
+    table: events
+    column: ingestion_ts
+    exact_count: 2
+    parameters:
+      delay_days_min: 1
+      delay_days_max: 2
+  - issue_id: out_of_order_events
+    type: out_of_order
+    table: events
+    exact_count: 2
+  - issue_id: replay_batch_one
+    type: file_replay
+    table: events
+    exact_count: 2
+    parameters:
+      source_batch: 1
+      target_batch: 2
+  - issue_id: schema_drift
+    type: schema_drift
+    table: events
+    exact_count: 1
+    parameters:
+      activation_batch: 2
+      add_columns:
+        - name: diagnostic_code
+          type: string
+  - issue_id: correlated_missing_description
+    type: correlated_missingness
+    table: events
+    column: description
+    exact_count: 2
+    parameters:
+      where:
+        source_system: legacy_batch
+        after_batch: 1
+outputs:
+  mode: both
+  catalog: sdf
+  schema_name: scenario_data_factory
+  include_clean: false
+  raw_format: json

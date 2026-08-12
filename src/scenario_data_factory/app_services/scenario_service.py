@@ -33,7 +33,7 @@ class AgentPlanningError(ValueError):
 
 
 _MAX_SCHEMA_DESIGN_ATTEMPTS = 1
-_MAX_SCHEMA_REPAIR_ATTEMPTS = 1
+_MAX_SCHEMA_REPAIR_ATTEMPTS = 2
 _SCHEMA_DESIGN_MAX_TOKENS = 8000
 _COMPLEX_SCHEMA_DESIGN_MAX_TOKENS = 12000
 _BASIC_SCHEMA_DESIGN_MAX_TOKENS = 4500
@@ -290,7 +290,7 @@ def _custom_spec_from_agent_or_fallback(prompt: str) -> tuple[ScenarioSpec, list
 def _complete_agent_schema_contract(
     prompt: str, intent: dict[str, Any]
 ) -> tuple[ScenarioSpec | None, list[str], str]:
-    """Validate an agent draft with one focused completion and one bounded repair."""
+    """Validate an agent draft with one focused completion and bounded model repairs."""
     current_intent = intent
     try:
         spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
@@ -311,11 +311,11 @@ def _complete_agent_schema_contract(
         except Exception as exc:
             current_error = str(exc)
 
-    # One full repair handles structural defects the focused completion cannot express.
+    # Bounded full repairs handle structural defects the focused completion cannot express.
     for _ in range(_MAX_SCHEMA_REPAIR_ATTEMPTS):
         repaired = _repair_custom_schema_intent_with_model(prompt, current_intent, current_error)
         if not repaired or not isinstance(repaired.get("table_specs"), list):
-            break
+            continue
         current_intent = _normalize_agent_intent(
             _normalize_repaired_intent(repaired, current_intent)
         )
@@ -928,7 +928,7 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
         "promotion": ("promotion",),
         "coupon redemption": ("coupon redemption", "redemption"),
         "coupon": ("coupon",),
-        "product": ("product",),
+        "product": ("products", "product_id"),
         "customer": ("customer",),
         "return": ("returns", "return"),
         "postal code": ("postal code", "postal"),
@@ -969,6 +969,7 @@ _SUPPORTED_FAKER_PROVIDERS = {
     "date_time",
     "domain_name",
     "email",
+    "file_name",
     "first_name",
     "iban",
     "job",
