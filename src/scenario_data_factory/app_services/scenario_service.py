@@ -32,6 +32,13 @@ class AgentPlanningError(ValueError):
     """Raised only after the model planner exhausts its internal recovery attempts."""
 
 
+_MAX_SCHEMA_DESIGN_ATTEMPTS = 1
+_MAX_SCHEMA_REPAIR_ATTEMPTS = 1
+_SCHEMA_DESIGN_MAX_TOKENS = 8000
+_COMPLEX_SCHEMA_DESIGN_MAX_TOKENS = 12000
+_BASIC_SCHEMA_DESIGN_MAX_TOKENS = 4500
+
+
 class ScenarioService:
     def __init__(
         self,
@@ -259,11 +266,12 @@ def _spec_from_prompt(prompt: str) -> tuple[ScenarioSpec, list[str]]:
 
 def _custom_spec_from_agent_or_fallback(prompt: str) -> tuple[ScenarioSpec, list[str]]:
     failures: list[str] = []
-    for _ in range(3):
+    for _ in range(_MAX_SCHEMA_DESIGN_ATTEMPTS):
         intent = _custom_schema_intent_from_model(prompt)
         if not intent or not isinstance(intent.get("table_specs"), list):
             failures.append("planner returned no usable schema")
             continue
+        intent = _normalize_agent_intent(intent)
         spec, assumptions, failure = _complete_agent_schema_contract(prompt, intent)
         if spec is not None:
             return spec, [
@@ -282,7 +290,7 @@ def _custom_spec_from_agent_or_fallback(prompt: str) -> tuple[ScenarioSpec, list
 def _complete_agent_schema_contract(
     prompt: str, intent: dict[str, Any]
 ) -> tuple[ScenarioSpec | None, list[str], str]:
-    """Validate an agent draft and let focused agent passes complete its missing contracts."""
+    """Validate an agent draft with one focused completion and one bounded repair."""
     current_intent = intent
     try:
         spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
@@ -290,61 +298,27 @@ def _complete_agent_schema_contract(
     except Exception as exc:
         current_error = str(exc)
 
-    enrichments: tuple[
-        tuple[
-            Any,
-            Any,
-            str,
-        ],
-        ...,
-    ] = (
-        (
-            _enrich_column_strategies_with_model,
-            _merge_model_column_strategies,
-            "field-generation",
-        ),
-        (
-            _enrich_issue_parameters_with_model,
-            _merge_model_issue_parameters,
-            "issue-execution",
-        ),
-        (
-            _enrich_operational_contracts_with_model,
-            _merge_model_operational_contracts,
-            "operational-execution",
-        ),
-        (
-            _enrich_relationship_contracts_with_model,
-            _merge_model_relationship_contracts,
-            "relationship-execution",
-        ),
-        (
-            _enrich_column_strategies_with_model,
-            _merge_model_column_strategies,
-            "field-generation-convergence",
-        ),
-        (
-            _enrich_issue_parameters_with_model,
-            _merge_model_issue_parameters,
-            "issue-execution-convergence",
-        ),
-    )
-    for enrich, merge, _contract_name in enrichments:
-        enrichment = enrich(prompt, current_intent, current_error)
-        if not enrichment:
-            continue
-        current_intent = merge(current_intent, enrichment)
+    # Most first-pass drafts only lack executable column strategies. A compact
+    # completion avoids asking the model to regenerate the entire schema.
+    enrichment = _enrich_column_strategies_with_model(prompt, current_intent, current_error)
+    if enrichment:
+        current_intent = _normalize_agent_intent(
+            _merge_model_column_strategies(current_intent, enrichment)
+        )
         try:
             spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
             return spec, assumptions, ""
         except Exception as exc:
             current_error = str(exc)
 
-    for _ in range(3):
+    # One full repair handles structural defects the focused completion cannot express.
+    for _ in range(_MAX_SCHEMA_REPAIR_ATTEMPTS):
         repaired = _repair_custom_schema_intent_with_model(prompt, current_intent, current_error)
         if not repaired or not isinstance(repaired.get("table_specs"), list):
             break
-        current_intent = _normalize_repaired_intent(repaired, current_intent)
+        current_intent = _normalize_agent_intent(
+            _normalize_repaired_intent(repaired, current_intent)
+        )
         try:
             spec, assumptions = _custom_spec_from_intent(current_intent, prompt)
             return spec, assumptions, ""
@@ -476,7 +450,7 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
         name=name,
         domain="custom_schema",
         seed=seed,
-        locale=str(intent.get("locale") or "en_CA"),
+        locale=_normalized_locale(intent.get("locale")),
         timeline=timeline,
         tables=tables,
         relationships=relationships,
@@ -577,6 +551,8 @@ def _column_semantic_from_intent(column: dict[str, Any]) -> dict[str, Any] | Non
             "sigma": distribution.get("sigma", 1.0),
             "max": distribution.get("max"),
         }
+    if isinstance(distribution, dict) and distribution.get("kind") in {"monthly", "timeline"}:
+        return {"kind": "timeline"}
     return None
 
 
@@ -584,14 +560,22 @@ def _column_weights_from_intent(column: dict[str, Any]) -> object:
     weights = column.get("weights")
     if weights is not None:
         values = column.get("values")
-        if isinstance(values, list) and isinstance(weights, list) and len(values) == len(weights):
+        if (
+            isinstance(values, list)
+            and isinstance(weights, list)
+            and len(values) == len(weights)
+            and all(isinstance(weight, (int, float)) and weight > 0 for weight in weights)
+        ):
             return weights
         return None
     values = column.get("values")
     distribution = column.get("distribution")
     if not isinstance(values, list) or not isinstance(distribution, dict) or "type" in distribution:
         return None
-    return [distribution.get(value) for value in values]
+    weights = [distribution.get(value) for value in values]
+    if not all(isinstance(weight, (int, float)) and weight > 0 for weight in weights):
+        return None
+    return weights
 
 
 def _normalize_repaired_intent(
@@ -624,6 +608,149 @@ def _normalize_repaired_intent(
     )
     if not executable and isinstance(previous.get("issues"), list):
         normalized["issues"] = previous["issues"]
+    return normalized
+
+
+def _normalize_agent_intent(intent: dict[str, Any]) -> dict[str, Any]:
+    """Accept lossless model JSON aliases before validating the executable contract."""
+    normalized = json.loads(json.dumps(intent))
+    locale = _normalized_locale(normalized.get("locale"))
+    for relationship in normalized.get("relationships", []):
+        if not isinstance(relationship, dict):
+            continue
+        if not relationship.get("parent_column") and isinstance(
+            relationship.get("parent_key"), str
+        ):
+            relationship["parent_column"] = relationship["parent_key"]
+        if not relationship.get("child_column") and isinstance(relationship.get("child_key"), str):
+            relationship["child_column"] = relationship["child_key"]
+        relationship.pop("parent_key", None)
+        relationship.pop("child_key", None)
+        constraints = relationship.setdefault("constraints", {})
+        if not isinstance(constraints, dict):
+            constraints = {}
+            relationship["constraints"] = constraints
+        nested_filter = constraints.pop("parent_filter", None)
+        if not relationship.get("parent_filter") and isinstance(nested_filter, dict):
+            relationship["parent_filter"] = nested_filter
+        for key in ("child_date_ranges", "aggregate_caps"):
+            top_level_value = relationship.pop(key, None)
+            if key not in constraints and isinstance(top_level_value, list):
+                constraints[key] = top_level_value
+
+    for table in normalized.get("table_specs", []):
+        if not isinstance(table, dict):
+            continue
+        table_name = str(table.get("name") or "").lower()
+        for column in table.get("columns", []):
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").lower()
+            if (
+                column.get("type") == ColumnType.STRING.value
+                and not column.get("primary_key")
+                and not column.get("faker")
+                and not column.get("values")
+                and not column.get("semantic")
+                and column_name in {"name", "full_name", "customer_name", "investigator_name"}
+            ):
+                column["faker"] = (
+                    "company"
+                    if any(token in table_name for token in ("institution", "company", "merchant"))
+                    else "name"
+                )
+            if (
+                column.get("type") == ColumnType.STRING.value
+                and not column.get("primary_key")
+                and not column.get("faker")
+                and not column.get("values")
+                and not column.get("semantic")
+                and column_name in {"kunnr", "bukrs", "belnr"}
+            ):
+                column["faker"] = "uuid4"
+            if column.get("faker") in {"both", "bothify"}:
+                column["faker"] = "sentence" if column_name.endswith("_name") else "uuid4"
+            if column.get("faker") == "commerce":
+                column["faker"] = "word"
+            if (
+                locale == "en_CA"
+                and column_name in {"province", "province_code"}
+                and column.get("faker") in {"state", "state_abbr", "province"}
+            ):
+                column.pop("faker", None)
+                column["values"] = [
+                    "ON",
+                    "QC",
+                    "BC",
+                    "AB",
+                    "MB",
+                    "SK",
+                    "NS",
+                    "NB",
+                    "NL",
+                    "PE",
+                ]
+            semantic = column.get("semantic")
+            if not isinstance(semantic, dict):
+                continue
+            distribution = semantic.pop("distribution", None)
+            if distribution == "log_normal" and not semantic.get("kind"):
+                semantic["kind"] = "log_normal"
+            if semantic.get("kind") == "uniform":
+                semantic["kind"] = "uniform_range"
+            if semantic.get("kind") in {"lognormal", "log-normal"}:
+                semantic["kind"] = "log_normal"
+            if semantic.get("kind") == "log_normal":
+                semantic.setdefault("sigma", 1.0)
+                has_numeric_tail_max = isinstance(semantic.get("tail_max"), (int, float))
+                if semantic.get("max") is None and has_numeric_tail_max:
+                    semantic["max"] = semantic["tail_max"]
+
+    for issue in normalized.get("issues", []):
+        if not isinstance(issue, dict) or issue.get("type") != IssueType.LATE_ARRIVAL.value:
+            continue
+        parameters = issue.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        if not parameters.get("event_time_column") and isinstance(issue.get("column"), str):
+            parameters["event_time_column"] = issue["column"]
+        delay_range = parameters.pop("delay_range_days", None)
+        if (
+            isinstance(delay_range, list)
+            and len(delay_range) == 2
+            and all(isinstance(value, (int, float)) for value in delay_range)
+        ):
+            parameters.setdefault("delay_days_min", int(delay_range[0]))
+            parameters.setdefault("delay_days_max", int(delay_range[1]))
+
+    tables_by_name = {
+        str(table.get("name")): table
+        for table in normalized.get("table_specs", [])
+        if isinstance(table, dict) and isinstance(table.get("name"), str)
+    }
+    normalized_issues: list[Any] = []
+    for issue in normalized.get("issues", []):
+        if not isinstance(issue, dict) or issue.get("type") != IssueType.DATE_RULE_VIOLATION.value:
+            normalized_issues.append(issue)
+            continue
+        parameters = issue.setdefault("parameters", {})
+        if not isinstance(parameters, dict) or parameters.get("after_column"):
+            normalized_issues.append(issue)
+            continue
+        table = tables_by_name.get(str(issue.get("table")))
+        target_column = issue.get("column")
+        candidates = [
+            str(column.get("name"))
+            for column in (table or {}).get("columns", [])
+            if isinstance(column, dict)
+            and column.get("name") != target_column
+            and column.get("type") in {ColumnType.DATE.value, ColumnType.TIMESTAMP.value}
+        ]
+        if candidates:
+            parameters["after_column"] = candidates[0]
+            parameters.setdefault("days_after", -1)
+            normalized_issues.append(issue)
+    normalized["issues"] = normalized_issues
     return normalized
 
 
@@ -661,6 +788,16 @@ def _timeline_from_intent(intent: dict[str, Any]) -> TimelineSpec:
             frequency=frequency,  # type: ignore[arg-type]
         )
     return TimelineSpec(start_date=date(2026, 1, 1), batches=30)
+
+
+def _normalized_locale(value: object) -> str:
+    locale = str(value or "en_CA").replace("-", "_")
+    aliases = {
+        "ca": "en_CA",
+        "canada": "en_CA",
+        "ca_es": "en_CA",
+    }
+    return aliases.get(locale.lower(), locale)
 
 
 def _metadata_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
@@ -799,7 +936,7 @@ def _custom_semantic_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
     gaps: list[str] = []
     mentioned_concepts = 0
     for concept, markers in concept_rules.items():
-        if any(marker in text for marker in markers):
+        if any(re.search(rf"\b{re.escape(marker)}\b", text) for marker in markers):
             mentioned_concepts += 1
             has_concept = any(
                 marker.replace(" ", "_") in searchable or marker in searchable
@@ -828,6 +965,7 @@ _SUPPORTED_FAKER_PROVIDERS = {
     "city",
     "company",
     "country",
+    "credit_card_number",
     "date_time",
     "domain_name",
     "email",
@@ -837,6 +975,7 @@ _SUPPORTED_FAKER_PROVIDERS = {
     "last_name",
     "name",
     "paragraph",
+    "phone_number",
     "postcode",
     "sentence",
     "state",
@@ -846,6 +985,7 @@ _SUPPORTED_FAKER_PROVIDERS = {
     "url",
     "user_name",
     "uuid4",
+    "word",
 }
 
 
@@ -946,9 +1086,9 @@ def _execution_rule_gaps(spec: ScenarioSpec, prompt: str) -> list[str]:
         if channel is None or not channel.values or not channel.weights:
             gaps.append("weighted orders.channel values")
     if "log-normal" in text or "log normal" in text:
-        amount = column("orders", "amount")
+        amount = column("orders", "amount") or column("orders", "order_amount")
         if amount is None or (amount.semantic or {}).get("kind") != "log_normal":
-            gaps.append("log-normal orders.amount rule")
+            gaps.append("log-normal orders amount rule")
     if "ship_date must be on or after" in text:
         ship_date = column("orders", "ship_date")
         semantic = ship_date.semantic if ship_date else {}
@@ -1203,7 +1343,15 @@ def _issue_parameter_reference_gaps(spec: ScenarioSpec) -> list[str]:
                 column = issue.parameters.get(parameter)
                 if column and column not in columns:
                     gaps.append(f"{issue.issue_id} references missing {parameter} {column}")
-        elif issue_type == IssueType.SCHEMA_DRIFT:
+        correlation = issue.correlation or issue.parameters.get("correlation") or {}
+        where = correlation.get("where") if isinstance(correlation, dict) else None
+        if isinstance(where, dict):
+            source_column = where.get("source_column")
+            if not isinstance(source_column, str) and "source_system" in where:
+                source_column = "source_system"
+            if isinstance(source_column, str) and source_column not in columns:
+                gaps.append(f"{issue.issue_id} correlation references missing {source_column}")
+        if issue_type == IssueType.SCHEMA_DRIFT:
             for rename in issue.parameters.get("rename_columns", []):
                 if isinstance(rename, dict) and rename.get("from") not in columns:
                     gaps.append(
@@ -2985,7 +3133,7 @@ def _agent_intent_from_model(prompt: str) -> tuple[dict[str, Any] | None, str]:
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=16000,
+            max_tokens=_SCHEMA_DESIGN_MAX_TOKENS,
         )
         intent = _json_from_text(_response_text(response))
         if intent is None:
@@ -2993,6 +3141,38 @@ def _agent_intent_from_model(prompt: str) -> tuple[dict[str, Any] | None, str]:
         return intent, "Model extracted scenario intent."
     except Exception as exc:
         return None, f"Model intent extraction failed; used deterministic parser: {exc}"
+
+
+def _schema_design_token_budget(prompt: str) -> int:
+    """Reserve the larger JSON budget only for explicitly broad enterprise designs."""
+    if _is_basic_schema_request(prompt):
+        return _BASIC_SCHEMA_DESIGN_MAX_TOKENS
+    text = prompt.lower()
+    enterprise_signals = (
+        "sap",
+        "loyalty",
+        "campaign",
+        "advertising",
+        "credit card",
+    )
+    if sum(signal in text for signal in enterprise_signals) >= 3:
+        return _COMPLEX_SCHEMA_DESIGN_MAX_TOKENS
+    return _SCHEMA_DESIGN_MAX_TOKENS
+
+
+def _is_basic_schema_request(prompt: str) -> bool:
+    """Identify terse requests that need a compact agent-designed operating model."""
+    text = prompt.lower()
+    if len(prompt) > 420 or "tables:" in text or "business rules:" in text:
+        return False
+    enterprise_signals = ("sap", "loyalty", "campaign", "advertising", "credit card")
+    return sum(signal in text for signal in enterprise_signals) < 2
+
+
+def _schema_design_system_prompt(prompt: str) -> str:
+    if _is_basic_schema_request(prompt):
+        return _BASIC_SCHEMA_SYSTEM_PROMPT
+    return _CUSTOM_SCHEMA_SYSTEM_PROMPT
 
 
 def _custom_schema_intent_from_model(prompt: str) -> dict[str, Any] | None:
@@ -3006,11 +3186,14 @@ def _custom_schema_intent_from_model(prompt: str) -> dict[str, Any] | None:
         response = WorkspaceClient().serving_endpoints.query(
             endpoint,
             messages=[
-                ChatMessage(role=ChatMessageRole.SYSTEM, content=_CUSTOM_SCHEMA_SYSTEM_PROMPT),
+                ChatMessage(
+                    role=ChatMessageRole.SYSTEM,
+                    content=_schema_design_system_prompt(prompt),
+                ),
                 ChatMessage(role=ChatMessageRole.USER, content=prompt),
             ],
             temperature=0.0,
-            max_tokens=16000,
+            max_tokens=_schema_design_token_budget(prompt),
         )
         return _json_from_text(_response_text(response))
     except Exception:
@@ -3039,7 +3222,7 @@ def _repair_custom_schema_intent_with_model(
                 ChatMessage(role=ChatMessageRole.USER, content=json.dumps(payload)),
             ],
             temperature=0.0,
-            max_tokens=16000,
+            max_tokens=_schema_design_token_budget(prompt),
         )
         return _json_from_text(_response_text(response))
     except Exception:
@@ -3094,18 +3277,21 @@ def _merge_model_column_strategies(
         table = tables.get(entry.get("table"))
         if not isinstance(table, dict):
             continue
+        column_name = entry.get("column") or entry.get("name")
         target = next(
             (
                 column
                 for column in table.get("columns", [])
-                if isinstance(column, dict) and column.get("name") == entry.get("column")
+                if isinstance(column, dict) and column.get("name") == column_name
             ),
             None,
         )
         if not isinstance(target, dict):
-            if isinstance(entry.get("column"), str) and entry.get("type"):
-                target = {key: value for key, value in entry.items() if key != "table"}
-                target["name"] = target.pop("column")
+            if isinstance(column_name, str) and entry.get("type"):
+                target = {
+                    key: value for key, value in entry.items() if key not in {"table", "column"}
+                }
+                target["name"] = column_name
                 table.setdefault("columns", []).append(target)
             else:
                 continue
@@ -3194,6 +3380,29 @@ def _merge_model_issue_parameters(
                     parameters.update(entry["parameters"])
             if isinstance(entry.get("correlation"), dict):
                 target["correlation"] = entry["correlation"]
+        elif (
+            entry.get("type") in {issue_type.value for issue_type in IssueType}
+            and isinstance(entry.get("table"), str)
+            and (
+                entry.get("rate") is not None
+                or entry.get("exact_count") is not None
+                or isinstance(entry.get("parameters"), dict)
+                and entry["parameters"].get("file_count") is not None
+            )
+        ):
+            issues.append(
+                {
+                    "issue_id": entry.get("issue_id")
+                    or f"iss_agent_completion_{len(issues) + 1:02d}",
+                    "type": entry["type"],
+                    "table": entry["table"],
+                    "column": entry.get("column"),
+                    "rate": entry.get("rate"),
+                    "exact_count": entry.get("exact_count"),
+                    "parameters": entry.get("parameters") or {},
+                    "correlation": entry.get("correlation"),
+                }
+            )
     return merged
 
 
@@ -3592,6 +3801,10 @@ Rules:
 - boolean: values [true, false] with meaningful weights.
 - independent integer/long business measures: min_value and max_value, or a semantic rule.
 - values must be real domain values, never name_1/city_1/field_42 placeholders.
+- When a null-value correlation has `where.source_system`, the affected table must contain a
+  string `source_system` column with that source value and at least one contrasting real source
+  value. For example, claims correlated with `legacy_batch` need values
+  ["legacy_batch", "online_portal"] on claims.source_system.
 Use the user prompt and existing schema names to choose realistic strategies.
 """
 
@@ -3601,11 +3814,13 @@ Return compact JSON only. Do not return tables, columns, relationships, commenta
 
 Input contains the user prompt, schema_intent, and a validation_error. Return exactly:
 {"issues":[{"issue_id":"optional","type":"...","table":"...","column":"...",
-"parameters":{},"correlation":{}}]}
+"rate":null,"exact_count":null,"parameters":{},"correlation":{}}]}
 
 Return an entry only for issue rules whose parameters are missing or invalid according
-to validation_error. Do not change rates, counts, tables, columns, issue types, or
-the schema. Select only existing columns from the supplied schema_intent.
+to validation_error. If validation_error says a requested issue type is missing, return one
+complete new issue with its requested table, column, and rate/count. Do not otherwise change
+rates, counts, tables, columns, issue types, or the schema. Select only existing columns from
+the supplied schema_intent.
 
 Rules:
 - Every date_rule_violation requires parameters.after_column naming an existing column
@@ -3622,6 +3837,9 @@ Rules:
   mutation using existing table context.
 - file_replay needs file_count, source_batch, and target_batch. Batches must be
   valid for the requested timeline.
+  For replayed inference files, return {"type":"file_replay","table":"model_inferences",
+  "column":null,"rate":null,"exact_count":null,"parameters":{"file_count":1,
+  "source_batch":2,"target_batch":4}}.
 Use the user's literal business rule to choose the parameters. Never invent a
 generic field name or replace the issue with prose.
 """
@@ -3685,9 +3903,58 @@ Rules:
   "parent_start_column":"effective_date","parent_end_column":"expiry_date"}]}}
   {"name":"claims_payments","parent_filter":{"column":"claim_status",
   "values":["approved","settled"]},"constraints":{"aggregate_caps":[{
-  "child_amount_column":"amount","parent_amount_column":"claim_amount",
+  "child_amount_column":"payment_amount","parent_amount_column":"claim_amount",
   "maximum_fraction":0.95}]}}
 """
+
+_BASIC_SCHEMA_SYSTEM_PROMPT = """
+You are a fast Scenario Data Factory schema-design agent. Return compact JSON only.
+
+Design a small, executable synthetic relational dataset from the user's short request.
+This is not a full enterprise architecture exercise: use 3 to 5 connected tables unless
+the user explicitly asks for more. Infer a central fact/event table; when the user gives
+one overall record count, assign it to that fact/event table exactly and choose plausible
+smaller dimensions. Do not create data-quality issues unless the user asks for them.
+
+For a basic Canadian banking request, create exactly these four practical tables unless
+the user asks for extra entities: customers, branches, accounts, transactions. Put the
+requested overall count on transactions. Connect customers to accounts and branches, and
+accounts to transactions. Include real Canadian cities/provinces, actual banking product
+categories, transaction types, channels, and readable categorical values. Use customer
+names through faker "name", cities through faker "city" or a province lookup, and never
+use city_1/name_1/place_1 placeholders. Use a timeline semantic for independent dates or
+timestamps, a date_offset for dependent dates, a numeric semantic for decimal amounts,
+and values/weights for categorical fields. Use locale "en_CA" for Canadian data.
+
+Allowed types: string, integer, long, decimal, date, timestamp, boolean.
+Supported Faker providers: address, ascii_email, city, company, country,
+credit_card_number, date_time, domain_name, email, first_name, iban, job, last_name,
+name, paragraph, phone_number, postcode, sentence, state, state_abbr, street_address,
+text, url, user_name, uuid4, word.
+
+Every table needs exactly one primary key. Every relationship needs existing parent and
+child key columns. Every non-key business field needs an executable strategy: faker,
+meaningful values, a lookup, a timeline/date-offset semantic, a numeric range, or a
+numeric distribution. Keep output mode as Delta plus raw and metadata.synthetic_data=true.
+
+Return this exact JSON shape:
+{
+  "domain":"custom_schema",
+  "name":"short descriptive name",
+  "seed":42,
+  "locale":"en_CA",
+  "timeline":{"start_date":"2025-01-01","batches":12,"frequency":"monthly"},
+  "table_counts":{},
+  "table_specs":[{
+    "name":"customers","row_count":1000,
+    "columns":[{"name":"customer_id","type":"long","primary_key":true,"nullable":false}]
+  }],
+  "relationships":[],
+  "issues":[],
+  "metadata":{"synthetic_data":true}
+}
+"""
+
 
 _CUSTOM_SCHEMA_SYSTEM_PROMPT = """
 You are a bounded Scenario Data Factory custom-schema planner.
@@ -3749,6 +4016,22 @@ Use relationship constraints for executable parent-child business rules. Support
 "parent_amount_column":"...","maximum_fraction":0.95}]}. Metadata records context only;
 every explicit statistic and business rule must also be encoded in executable columns,
 relationships, or issue parameters.
+For the insurance rules "active policy on the loss_date", "payments only for
+approved or settled claims", and "late_arrival on payments", use this exact
+shape (the `parent_filter` belongs beside `constraints`, never inside it):
+{"name":"policies_claims","parent_table":"policies","parent_column":"policy_id",
+ "child_table":"claims","child_column":"policy_id",
+ "parent_filter":{"column":"status","values":["active"]},
+ "constraints":{"child_date_ranges":[{"child_column":"loss_date",
+ "parent_start_column":"effective_date","parent_end_column":"expiry_date"}]}}
+{"name":"claims_payments","parent_table":"claims","parent_column":"claim_id",
+ "child_table":"payments","child_column":"claim_id",
+ "parent_filter":{"column":"claim_status","values":["approved","settled"]},
+ "constraints":{"aggregate_caps":[{"child_amount_column":"payment_amount",
+ "parent_amount_column":"claim_amount","maximum_fraction":0.95}]}}
+{"type":"late_arrival","table":"payments","column":"payment_date","rate":0.05,
+ "parameters":{"event_time_column":"payment_date","arrival_column":"ingestion_ts",
+ "delay_days_min":1,"delay_days_max":7}}
 Issues must reference existing tables and columns, except table-level issues.
 If the user supplies a count for a central fact/event table, preserve that count
 exactly and infer plausible counts for parent dimensions and downstream event tables.
@@ -3787,6 +4070,17 @@ late feedback to feedback_scores.created_at with ingestion_ts as arrival column,
 inference files to file_replay on model_inferences, invalid model versions to
 model_inferences.model_version, invalid tenant regions to tenant_metadata.region, and
 feedback-before-inference to feedback_scores.created_at using inference_created_at.
+For feedback-before-inference, feedback_scores must contain both timestamp columns.
+Generate clean feedback_scores.created_at as a date_offset after inference_created_at, and encode
+the intentional defect as {"type":"date_rule_violation","table":"feedback_scores",
+"column":"created_at","parameters":{"after_column":"inference_created_at","days_after":-1}}.
+The model_inferences-to-feedback_scores relationship is an ordinary inference_id foreign-key
+relationship with no child_date_ranges constraint: both feedback timestamp fields are local to
+feedback_scores. Issue types are not physical data columns. Never create columns named
+file_replay, schema_drift, duplicate_record, late_arrival, or referential_orphan; encode those
+only in the issues list with executable parameters.
+For decimal scores, use semantic {"kind":"uniform_range","min":0,"max":1} (or 0 to 5 for
+rating scores), not `uniform`. Do not infer a products table from the word "production".
 For retail sales guardrail prompts with customers, orders, and returns, preserve those
 tables. Treat a prompt like "Generate 500,000 records for a retail sales scenario"
 as orders=500000 unless the user explicitly assigns the count elsewhere. Preserve
@@ -3797,6 +4091,17 @@ with after_column order_date, and null_value on returns.reason to returns.reason
 Use population-derived weights for customers.state, a state-keyed city lookup with
 real cities, weighted online/in_store values for channel, a log_normal amount rule,
 and a date_offset rule for clean ship_date values.
+For Canadian banking prompts that mention SAP, loyalty, cards, campaigns, or advertising,
+design a connected banking operating model, for example customer master/business partners,
+branches, banking products, credit cards, account or card transactions, loyalty members and
+point-ledger activity, campaigns, and advertising events. Use SAP-style business identifiers
+where helpful (for example customer_number/KUNNR, company_code/BUKRS, document_number/BELNR)
+alongside readable analytics fields. Use actual Canadian cities, branches, products, campaign
+names, transaction types, and channel values through categorical values, semantic lookups, or
+supported Faker providers. Do not add data-quality issue rules unless the user explicitly asks
+for them. Supported Faker providers are: address, bank_country, city, company, country,
+credit_card_number, email, first_name, iban, job, last_name, name, paragraph, postcode,
+sentence, state, state_abbr, street_address, text, url, user_name, uuid4, and word.
 
 Supported issue types:
 null_value, blank_value, duplicate_record, invalid_format, invalid_value,
@@ -3871,6 +4176,11 @@ explicit user-listed tables with a generic source/event schema.
 
 Every named business entity in the prompt must be represented as a table or a
 relationship-bearing column. Multi-entity prompts should use 4 to 8 related tables.
+Issue types belong only in the `issues` list, never as physical schema columns. In
+particular, do not create columns named file_replay, schema_drift, duplicate_record,
+late_arrival, or referential_orphan. A relationship child_date_ranges constraint may
+reference only columns that actually exist on its parent and child tables; remove it
+when the user's rule is instead represented by local event timestamps.
 
 Every non-key string column must use a real semantic value strategy: a supported
 Faker provider, meaningful categorical values, or a bounded semantic lookup tied
@@ -3936,10 +4246,22 @@ and a null_value correlation object when requested. Use relationship constraints
 child_date_ranges and aggregate_caps to enforce policy-date and payment-total rules.
 Late-arrival repairs must add a separate ingestion timestamp and name both the event
 and arrival columns in the issue parameters.
+For insurance claims, repair the three core relationship contracts exactly as follows:
+`policies_claims.parent_filter` is `{"column":"status","values":["active"]}` and its
+`constraints.child_date_ranges` maps claims.loss_date to policies.effective_date and
+policies.expiry_date; `claims_payments.parent_filter` is
+`{"column":"claim_status","values":["approved","settled"]}` and its
+`constraints.aggregate_caps` maps payments.payment_amount to claims.claim_amount; and a
+late_arrival payment issue has `event_time_column`, `arrival_column`, `delay_days_min`, and
+`delay_days_max`. These keys must be executable JSON fields, not metadata or prose.
 For a financial-crime or banking schema inferred from a short prompt, use faker
 "name" for suspects.full_name (or equivalent person names), faker "iban" for
 accounts.account_number, meaningful categorical values for risk/status/type fields,
 and explicit date/numeric rules for every business measure.
+For AI feedback-before-inference requests, feedback_scores must have local
+inference_created_at and created_at timestamps, with created_at generated as a
+date_offset from inference_created_at. The model_inferences-to-feedback_scores
+relationship must be a plain inference_id relationship without child_date_ranges.
 
 Allowed column types:
 string, integer, long, decimal, date, timestamp, boolean.

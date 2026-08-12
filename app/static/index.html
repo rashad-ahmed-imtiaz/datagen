@@ -318,34 +318,35 @@
       status.textContent = message;
       try {
         return await fn();
-      } catch {
-        status.textContent = 'The planner could not complete this draft. No data was generated.';
-        say('agent', 'I could not complete a valid executable draft after retrying. No data was generated. Please submit the request again.');
+      } catch (error) {
+        const detail = error?.message || 'The planner could not complete this draft. No data was generated.';
+        status.textContent = detail;
+        say('agent', detail);
         return null;
       }
     }
 
-    function wait(milliseconds) {
-      return new Promise((resolve) => setTimeout(resolve, milliseconds));
-    }
-
-    async function draftWithRecovery(prompt) {
-      let lastError = null;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        try {
-          return await api('/api/agent/draft', {
-            method: 'POST',
-            body: JSON.stringify({prompt})
-          });
-        } catch (error) {
-          lastError = error;
-          if (attempt < 2) {
-            status.textContent = 'Refining the agent plan...';
-            await wait(750);
-          }
-        }
+    async function draftScenario(prompt) {
+      const progress = [
+        'Designing tables and relationships...',
+        'Encoding distributions and business rules...',
+        'Checking the scenario contract...',
+        'Finishing the executable draft...'
+      ];
+      let progressIndex = 0;
+      status.textContent = progress[progressIndex];
+      const progressTimer = setInterval(() => {
+        progressIndex = Math.min(progressIndex + 1, progress.length - 1);
+        status.textContent = progress[progressIndex];
+      }, 15000);
+      try {
+        return await api('/api/agent/draft', {
+          method: 'POST',
+          body: JSON.stringify({prompt})
+        });
+      } finally {
+        clearInterval(progressTimer);
       }
-      throw lastError || new Error('Scenario planner unavailable');
     }
 
     function renderScenario(data) {
@@ -465,7 +466,7 @@
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return;
       say('user', prompt);
-      const data = await action('Drafting scenario...', () => draftWithRecovery(prompt));
+      const data = await action('Drafting scenario...', () => draftScenario(prompt));
       if (!data) return;
       renderScenario(data);
       say('agent', 'Drafted ' + data.name + ' with ' + data.issues.length + ' issue rules.');

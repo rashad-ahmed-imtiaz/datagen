@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -10,6 +11,7 @@ from scenario_data_factory.app_services.scenario_service import AgentPlanningErr
 
 app = FastAPI(title="Scenario Data Factory")
 service = ScenarioService()
+_DRAFT_TIMEOUT_SECONDS = 120
 
 
 class DraftRequest(BaseModel):
@@ -45,7 +47,18 @@ async def health() -> dict[str, str]:
 @app.post("/api/agent/draft")
 async def create_scenario_from_prompt(request: PromptDraftRequest) -> dict[str, object]:
     try:
-        return service.create_scenario_from_prompt(request.prompt)
+        return await asyncio.wait_for(
+            asyncio.to_thread(service.create_scenario_from_prompt, request.prompt),
+            timeout=_DRAFT_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "The scenario planner did not finish within two minutes. "
+                "No data or tables were created; please submit the request again."
+            ),
+        ) from exc
     except AgentPlanningError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:

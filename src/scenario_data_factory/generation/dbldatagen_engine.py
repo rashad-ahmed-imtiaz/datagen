@@ -67,7 +67,10 @@ class DbldatagenEngine(BaselineGenerator):
         if provider:
             from dbldatagen.text_generator_plugins import FakerTextFactory
 
-            resolved["text"] = FakerTextFactory(locale=locale.replace("-", "_"))(provider)
+            faker_locale = _supported_faker_locale(locale)
+            resolved["text"] = FakerTextFactory(locale=faker_locale)(
+                _supported_faker_provider(str(provider), faker_locale)
+            )
         return resolved
 
     @staticmethod
@@ -101,6 +104,37 @@ class DbldatagenEngine(BaselineGenerator):
         for column in table.columns:
             semantic = column.semantic or {}
             kind = semantic.get("kind")
+            if column.values:
+                spark_type = column.type.value
+                choices = [F.lit(value).cast(spark_type) for value in column.values]
+                if column.weights and len(column.weights) == len(choices):
+                    total = sum(float(weight) for weight in column.weights)
+                    if total > 0:
+                        weights = [
+                            max(1, round(float(weight) / total * 10_000))
+                            for weight in column.weights
+                        ]
+                        weights[-1] += 10_000 - sum(weights)
+                        bucket = F.pmod(F.xxhash64(F.col(record_key)), F.lit(10_000))
+                        expression = choices[-1]
+                        bounds: list[int] = []
+                        running_total = 0
+                        for weight in weights[:-1]:
+                            running_total += weight
+                            bounds.append(running_total)
+                        for choice, upper_bound in reversed(
+                            list(zip(choices[:-1], bounds, strict=True))
+                        ):
+                            expression = F.when(bucket < F.lit(upper_bound), choice).otherwise(
+                                expression
+                            )
+                        df = df.withColumn(column.name, expression)
+                        continue
+                position = (
+                    F.pmod(F.col(record_key) - F.lit(1), F.lit(len(choices))) + F.lit(1)
+                ).cast("int")
+                df = df.withColumn(column.name, F.element_at(F.array(*choices), position))
+                continue
             if kind == "date_offset":
                 base_column = semantic.get("base_column")
                 min_days = semantic.get("min_days", 0)
@@ -419,6 +453,29 @@ def dbldatagen_version() -> str:
     import importlib.metadata
 
     return importlib.metadata.version("dbldatagen")
+
+
+def _supported_faker_locale(locale: str) -> str:
+    normalized = locale.replace("-", "_")
+    aliases = {"ca": "en_CA", "canada": "en_CA", "ca_es": "en_CA"}
+    normalized = aliases.get(normalized.lower(), normalized)
+    try:
+        from faker.config import AVAILABLE_LOCALES
+
+        return normalized if normalized in AVAILABLE_LOCALES else "en_US"
+    except Exception:
+        return normalized
+
+
+def _supported_faker_provider(provider: str, locale: str) -> str:
+    """Use a safe text provider instead of failing a distributed Spark write."""
+    try:
+        from faker import Faker
+
+        getattr(Faker(locale), provider)
+        return provider
+    except Exception:
+        return "word"
 
 
 def _patch_dbldatagen_for_serverless_spark_connect(dg: Any) -> None:

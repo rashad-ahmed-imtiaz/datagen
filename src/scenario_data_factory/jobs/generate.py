@@ -31,6 +31,7 @@ def run_generation(
     clean = DbldatagenEngine().generate(spark, spec, partitions=partitions)
     dirty = dict(clean)
     plan = build_issue_plan(spec)
+    has_issues = bool(spec.issues)
 
     for issue in spec.issues:
         table = issue.table
@@ -45,14 +46,15 @@ def run_generation(
         and spec.outputs.catalog
         and spec.outputs.schema_name
     ):
-        written["dirty_delta_tables"] = write_delta_tables(
-            dirty,
-            spec.outputs.catalog,
-            spec.outputs.schema_name,
-            spec.outputs.dirty_delta_prefix,
-            namespace=spec.name,
-        )
-        if spec.outputs.include_clean:
+        if has_issues:
+            written["dirty_delta_tables"] = write_delta_tables(
+                dirty,
+                spec.outputs.catalog,
+                spec.outputs.schema_name,
+                spec.outputs.dirty_delta_prefix,
+                namespace=spec.name,
+            )
+        if spec.outputs.include_clean or not has_issues:
             written["clean_delta_tables"] = write_delta_tables(
                 clean,
                 spec.outputs.catalog,
@@ -61,11 +63,12 @@ def run_generation(
                 namespace=spec.name,
             )
     if spec.outputs.mode in {OutputMode.RAW, OutputMode.BOTH, "raw", "both"}:
-        raw_dirty = apply_physical_raw_issues(dirty, spec, plan)
-        written["raw_dirty_paths"] = write_raw_batches(
-            raw_dirty, run_root / "raw" / "dirty", spec.outputs.raw_format
-        )
-        if spec.outputs.include_clean:
+        if has_issues:
+            raw_dirty = apply_physical_raw_issues(dirty, spec, plan)
+            written["raw_dirty_paths"] = write_raw_batches(
+                raw_dirty, run_root / "raw" / "dirty", spec.outputs.raw_format
+            )
+        if spec.outputs.include_clean or not has_issues:
             written["raw_clean_paths"] = write_raw_batches(
                 clean, run_root / "raw" / "clean", spec.outputs.raw_format
             )
