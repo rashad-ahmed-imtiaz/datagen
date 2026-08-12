@@ -5,6 +5,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,7 +14,9 @@ from scenario_data_factory.exceptions import ScenarioDataFactoryError
 
 class RunRepository:
     def __init__(self, root: str | Path = ".sdf/runs") -> None:
-        self.root = Path(root).resolve()
+        root_text = str(root).replace("\\", "/").rstrip("/")
+        self._volume_root = root_text if root_text.startswith("/Volumes/") else None
+        self.root = Path(root_text) if self._volume_root else Path(root).resolve()
         self._lock = threading.RLock()
 
     def _path(self, run_id: str) -> Path:
@@ -38,11 +41,25 @@ class RunRepository:
     def save(self, run: dict[str, object]) -> None:
         run_id = str(run["run_id"])
         with self._lock:
+            if self._volume_root:
+                client = _workspace_files()
+                client.create_directory(self._volume_root)
+                client.upload(
+                    self._volume_path(run_id),
+                    BytesIO(json.dumps(run, indent=2, sort_keys=True).encode("utf-8")),
+                    overwrite=True,
+                )
+                return
             self.root.mkdir(parents=True, exist_ok=True)
             _atomic_write(self._path(run_id), json.dumps(run, indent=2, sort_keys=True))
 
     def get(self, run_id: str) -> dict[str, object]:
         with self._lock:
+            if self._volume_root:
+                response = _workspace_files().download(self._volume_path(run_id))
+                if response.contents is None:
+                    raise FileNotFoundError(run_id)
+                return json.loads(response.contents.read().decode("utf-8"))
             return json.loads(self._path(run_id).read_text(encoding="utf-8"))
 
     def update_status(self, run_id: str, status: str, **fields: object) -> dict[str, object]:
@@ -54,6 +71,11 @@ class RunRepository:
             self.save(run)
             return run
 
+    def _volume_path(self, run_id: str) -> str:
+        self._path(run_id)
+        assert self._volume_root is not None
+        return f"{self._volume_root}/{run_id}.json"
+
 
 def _atomic_write(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -63,3 +85,9 @@ def _atomic_write(path: Path, content: str) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _workspace_files():
+    from databricks.sdk import WorkspaceClient
+
+    return WorkspaceClient().files
