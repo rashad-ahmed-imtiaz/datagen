@@ -882,6 +882,50 @@ def _normalize_agent_intent(intent: dict[str, Any]) -> dict[str, Any]:
                 if semantic.get("max") is None and has_numeric_tail_max:
                     semantic["max"] = semantic["tail_max"]
 
+        if locale == "en_CA":
+            columns_by_name = {
+                str(column.get("name")).lower(): column
+                for column in table.get("columns", [])
+                if isinstance(column, dict) and isinstance(column.get("name"), str)
+            }
+            province = (
+                columns_by_name.get("province")
+                or columns_by_name.get("province_code")
+                or columns_by_name.get("state")
+                or columns_by_name.get("state_code")
+            )
+            city = columns_by_name.get("city")
+            if isinstance(province, dict) and isinstance(city, dict):
+                province_values = province.get("values")
+                if not isinstance(province_values, list) or not province_values:
+                    province_values = list(_CANADIAN_CITIES_BY_PROVINCE)
+                    province["values"] = province_values
+                supported_provinces = {
+                    str(value): _CANADIAN_PROVINCE_CODES.get(
+                        str(value).upper(), str(value).upper()
+                    )
+                    for value in province_values
+                }
+                supported_provinces = {
+                    value: code
+                    for value, code in supported_provinces.items()
+                    if code in _CANADIAN_CITIES_BY_PROVINCE
+                }
+                if supported_provinces:
+                    # Faker's en_CA city provider emits synthetic locality names.
+                    # Use real cities and preserve province-to-city consistency.
+                    city.pop("faker", None)
+                    city.pop("values", None)
+                    city.pop("weights", None)
+                    city["semantic"] = {
+                        "kind": "lookup",
+                        "key_column": province["name"],
+                        "values_by_key": {
+                            value: _CANADIAN_CITIES_BY_PROVINCE[code]
+                            for value, code in supported_provinces.items()
+                        },
+                    }
+
     for issue in normalized.get("issues", []):
         if not isinstance(issue, dict) or issue.get("type") != IssueType.LATE_ARRIVAL.value:
             continue
@@ -1163,6 +1207,39 @@ _SUPPORTED_FAKER_PROVIDERS = {
     "user_name",
     "uuid4",
     "word",
+}
+
+_CANADIAN_CITIES_BY_PROVINCE = {
+    "ON": ["Toronto", "Ottawa", "Mississauga", "Hamilton", "London", "Kitchener"],
+    "QC": ["Montreal", "Quebec City", "Laval", "Gatineau", "Sherbrooke"],
+    "BC": ["Vancouver", "Surrey", "Burnaby", "Victoria", "Kelowna"],
+    "AB": ["Calgary", "Edmonton", "Red Deer", "Lethbridge"],
+    "MB": ["Winnipeg", "Brandon"],
+    "SK": ["Saskatoon", "Regina"],
+    "NS": ["Halifax", "Sydney"],
+    "NB": ["Moncton", "Fredericton", "Saint John"],
+    "NL": ["St. John's", "Corner Brook"],
+    "PE": ["Charlottetown"],
+    "YT": ["Whitehorse"],
+    "NT": ["Yellowknife"],
+    "NU": ["Iqaluit"],
+}
+
+_CANADIAN_PROVINCE_CODES = {
+    "ONTARIO": "ON",
+    "QUEBEC": "QC",
+    "QUÉBEC": "QC",
+    "BRITISH COLUMBIA": "BC",
+    "ALBERTA": "AB",
+    "MANITOBA": "MB",
+    "SASKATCHEWAN": "SK",
+    "NOVA SCOTIA": "NS",
+    "NEW BRUNSWICK": "NB",
+    "NEWFOUNDLAND AND LABRADOR": "NL",
+    "PRINCE EDWARD ISLAND": "PE",
+    "YUKON": "YT",
+    "NORTHWEST TERRITORIES": "NT",
+    "NUNAVUT": "NU",
 }
 
 

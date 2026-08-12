@@ -12,6 +12,7 @@ from scenario_data_factory.app_services.scenario_service import (
     _databricks_run_id,
     _faker_provider_available,
     _json_from_text,
+    _normalize_agent_intent,
 )
 from scenario_data_factory.persistence.run_repository import RunRepository
 from scenario_data_factory.persistence.scenario_repository import ScenarioRepository
@@ -324,6 +325,62 @@ def test_truncated_model_json_returns_none() -> None:
 def test_locale_aware_faker_provider_validation_accepts_file_paths() -> None:
     assert _faker_provider_available("file_path", "en_US")
     assert not _faker_provider_available("__class__", "en_US")
+
+
+def test_canadian_city_fields_use_real_province_keyed_lookups() -> None:
+    intent = _agent_intent()
+    tables = intent["table_specs"]
+    assert isinstance(tables, list)
+    customers = tables[0]
+    assert isinstance(customers, dict)
+    columns = customers["columns"]
+    assert isinstance(columns, list)
+    columns.append({"name": "province", "type": "string", "values": ["ON", "QC", "BC"]})
+    intent["locale"] = "en_CA"
+
+    normalized = _normalize_agent_intent(intent)
+    city = next(
+        column
+        for column in normalized["table_specs"][0]["columns"]
+        if column["name"] == "city"
+    )
+
+    assert city["semantic"]["kind"] == "lookup"
+    assert city["semantic"]["key_column"] == "province"
+    assert city["semantic"]["values_by_key"]["ON"] == [
+        "Toronto",
+        "Ottawa",
+        "Mississauga",
+        "Hamilton",
+        "London",
+        "Kitchener",
+    ]
+    assert "faker" not in city
+
+
+def test_canadian_city_lookup_accepts_full_province_names() -> None:
+    intent = _agent_intent()
+    tables = intent["table_specs"]
+    assert isinstance(tables, list)
+    customers = tables[0]
+    assert isinstance(customers, dict)
+    columns = customers["columns"]
+    assert isinstance(columns, list)
+    columns.append(
+        {"name": "province", "type": "string", "values": ["Ontario", "Quebec"]}
+    )
+    intent["locale"] = "en_CA"
+
+    normalized = _normalize_agent_intent(intent)
+    city = next(
+        column
+        for column in normalized["table_specs"][0]["columns"]
+        if column["name"] == "city"
+    )
+
+    assert city["semantic"]["key_column"] == "province"
+    assert city["semantic"]["values_by_key"]["Ontario"][0] == "Toronto"
+    assert city["semantic"]["values_by_key"]["Quebec"][0] == "Montreal"
 
 
 def test_databricks_submission_extracts_the_sdk_waiter_response_run_id() -> None:
