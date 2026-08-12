@@ -15,6 +15,11 @@ class NullValuePlugin(IssuePlugin):
         from pyspark.sql import functions as F
         from pyspark.sql.window import Window
 
+        if not issue.column:
+            raise ValueError("null_value requires a target column")
+        if issue.column not in df.columns:
+            raise ValueError(f"null_value references missing column {issue.table}.{issue.column}")
+
         keys = [t.record_key for t in targets if t.issue_id == issue.issue_id]
         correlation = issue.correlation or issue.parameters.get("correlation") or {}
         where = correlation.get("where") if isinstance(correlation, dict) else None

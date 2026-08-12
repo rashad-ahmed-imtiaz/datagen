@@ -181,6 +181,18 @@ class IssueSpec(BaseModel):
 
     @model_validator(mode="after")
     def require_rate_or_count(self) -> IssueSpec:
+        column_required_types = {
+            IssueType.NULL_VALUE,
+            IssueType.BLANK_VALUE,
+            IssueType.INVALID_FORMAT,
+            IssueType.INVALID_VALUE,
+            IssueType.REFERENTIAL_ORPHAN,
+            IssueType.DATE_RULE_VIOLATION,
+            IssueType.LATE_ARRIVAL,
+            IssueType.CORRELATED_MISSINGNESS,
+        }
+        if self.type in column_required_types and not self.column:
+            raise ValueError(f"{self.type.value} requires a target column")
         if self.type == IssueType.FILE_REPLAY and self.parameters.get("file_count") is not None:
             return self
         if self.rate is None and self.exact_count is None:
