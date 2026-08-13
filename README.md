@@ -16,6 +16,10 @@ The project is deliberately split into two layers:
 No model-generated Python or SQL is executed. The model produces a typed scenario contract; the
 engine validates it before any generation job can run.
 
+## Contributor
+
+Rashad Ahmed Imtiaz
+
 ## What You Can Build
 
 Use a natural-language request for any business domain, for example:

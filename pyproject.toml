@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Databricks-native accelerator for reproducible synthetic data with deliberate data issues."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Scenario Data Factory Contributors" }]
+authors = [
+  { name = "Rashad Ahmed Imtiaz" },
+  { name = "Scenario Data Factory Contributors" },
+]
 dependencies = [
   "databricks-sdk>=0.59.0",
   "dbldatagen==0.4.0",
