@@ -11,7 +11,7 @@ The project is deliberately split into two layers:
 - **Authoring:** the Databricks App uses a bound model-serving endpoint to infer tables, columns,
   relationships, distributions, business rules, batches, and data-quality issues from a prompt.
 - **Execution:** an approved YAML or JSON `ScenarioSpec` is validated and generated without an
-  agent. This keeps production generation reproducible and reviewable.
+  agent. This  keeps production generation reproducible and reviewable.
 
 No model-generated Python or SQL is executed. The model produces a typed scenario contract; the
 engine validates it before any generation job can run.
