@@ -124,21 +124,48 @@ def install(
     profile: str,
     target: str = "dev",
     model_endpoint: str = "databricks-gpt-oss-120b",
+    catalog: str = "sdf",
+    schema: str = "scenario_data_factory",
+    app_name: str = "scenario-data-factory",
     engine_only: bool = False,
 ) -> None:
-    bundle_vars = ["--var", f"model_endpoint={model_endpoint}"]
+    bundle_vars = [
+        "--var",
+        f"model_endpoint={model_endpoint}",
+        "--var",
+        f"catalog={catalog}",
+        "--var",
+        f"schema={schema}",
+        "--var",
+        f"app_name={app_name}",
+    ]
     _run(["uv", "sync", "--extra", "dev", "--extra", "spark", "--extra", "app"])
     _run(["uv", "build"])
     _run(
         ["databricks", "bundle", "validate", "--profile", profile, "--target", target, *bundle_vars]
     )
     _run(["databricks", "bundle", "deploy", "--profile", profile, "--target", target, *bundle_vars])
+    summary = _capture_json(
+        [
+            "databricks",
+            "bundle",
+            "summary",
+            "--profile",
+            profile,
+            "--target",
+            target,
+            *bundle_vars,
+            "-o",
+            "json",
+        ]
+    )
+    control_volume = summary["resources"]["volumes"]["control_volume"]["id"]
     _run(
         [
             "databricks",
             "fs",
             "mkdirs",
-            "dbfs:/Volumes/sdf/scenario_data_factory/sdf_control/scenarios",
+            f"dbfs:/Volumes/{control_volume}/scenarios",
             "--profile",
             profile,
         ]
@@ -149,7 +176,7 @@ def install(
             "fs",
             "cp",
             "examples/insurance_claims.yaml",
-            "dbfs:/Volumes/sdf/scenario_data_factory/sdf_control/scenarios/current.yaml",
+            f"dbfs:/Volumes/{control_volume}/scenarios/current.yaml",
             "--profile",
             profile,
             "--overwrite",
@@ -182,28 +209,14 @@ def install(
         ]
     )
     if not engine_only:
-        summary = _capture_json(
-            [
-                "databricks",
-                "bundle",
-                "summary",
-                "--profile",
-                profile,
-                "--target",
-                target,
-                *bundle_vars,
-                "-o",
-                "json",
-            ]
-        )
         app_source_path = summary["resources"]["apps"]["scenario_data_factory"]["source_code_path"]
-        _run(["databricks", "apps", "start", "scenario-data-factory", "--profile", profile])
+        _run(["databricks", "apps", "start", app_name, "--profile", profile])
         _run(
             [
                 "databricks",
                 "apps",
                 "deploy",
-                "scenario-data-factory",
+                app_name,
                 "--profile",
                 profile,
                 "--source-code-path",

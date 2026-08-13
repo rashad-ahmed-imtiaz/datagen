@@ -56,9 +56,11 @@ You need:
 3. [uv](https://docs.astral.sh/uv/getting-started/installation/) for Python environment and
    dependency management.
 4. The [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
-5. A Databricks workspace where you can create a schema, volumes, jobs, an experiment, and a
-   Databricks App.
-6. A model-serving or Foundation Model endpoint the App service principal can query.
+5. A Unity Catalog-enabled Databricks workspace with an existing catalog they can use. The bundle
+   creates the schema and managed volumes inside that catalog.
+6. Permission to create schemas, managed volumes, Jobs, MLflow experiments, and a Databricks App;
+   and to create/write Delta tables in the generated schema.
+7. A model-serving or Foundation Model endpoint the App service principal can query.
 
 For local App authoring, the same endpoint must be reachable through your authenticated Databricks
 CLI profile. Full-scale data generation should run in the deployed Databricks job.
@@ -96,48 +98,84 @@ The bundle defaults are `catalog=sdf`, `schema=scenario_data_factory`, and
 `app_name=scenario-data-factory`. Override them during deployment when your workspace uses
 different names.
 
-## Deploy To Databricks
+### First-Time Deployment In Your Own Workspace
 
-Set the profile and endpoint once for the current PowerShell session:
+Teammates do **not** need to manually create the schema or the `sdf_control` and `sdf_raw`
+volumes. `databricks bundle deploy` provisions them. They do need an existing Unity Catalog
+catalog and the permissions to create objects within it. A platform administrator should provide:
+
+- a catalog name, such as `team_sandbox`;
+- a queryable model-serving or Foundation Model endpoint;
+- permission for the deployer to use the catalog and create schemas, volumes, Jobs, experiments,
+  and Apps;
+- permission for the deployed App service principal to query the model, manage generation-job
+  runs, and write to the control/raw volumes if those grants are not applied automatically.
+
+Before deployment, choose values that belong to their workspace:
 
 ```powershell
-$Profile = "<profile>"
-$Endpoint = "<model-serving-endpoint>"
+$Profile = "my-workspace-profile"
+$Catalog = "team_sandbox"             # Existing Unity Catalog catalog
+$Schema = "scenario_data_factory"     # Bundle creates this schema and its volumes
+$Endpoint = "my-model-serving-endpoint"
+$AppName = "scenario-data-factory-analytics"
 ```
 
-Validate and deploy the bundle. This builds the wheel, creates the schema and volumes, and deploys
-the initialize, preview, generate, and smoke-test jobs.
+Authenticate and verify the target workspace:
+
+```powershell
+databricks auth login --host https://<workspace-host>
+databricks current-user me --profile $Profile
+```
+
+Build and deploy all workspace resources:
 
 ```powershell
 uv build
-databricks bundle validate --profile $Profile --target dev --var model_endpoint=$Endpoint
-databricks bundle deploy --profile $Profile --target dev --var model_endpoint=$Endpoint
+databricks bundle validate --profile $Profile --target dev `
+  --var catalog=$Catalog --var schema=$Schema `
+  --var app_name=$AppName --var model_endpoint=$Endpoint
+databricks bundle deploy --profile $Profile --target dev `
+  --var catalog=$Catalog --var schema=$Schema `
+  --var app_name=$AppName --var model_endpoint=$Endpoint
 ```
 
-Deploy the Databricks App from the source path resolved by the bundle:
+Then deploy the App using the source path returned by the bundle:
 
 ```powershell
 $Summary = databricks bundle summary --profile $Profile --target dev `
-  --var model_endpoint=$Endpoint -o json | ConvertFrom-Json
+  --var catalog=$Catalog --var schema=$Schema `
+  --var app_name=$AppName --var model_endpoint=$Endpoint -o json | ConvertFrom-Json
 $SourcePath = $Summary.resources.apps.scenario_data_factory.source_code_path
 
-databricks apps start scenario-data-factory --profile $Profile
-databricks apps deploy scenario-data-factory --profile $Profile `
+databricks apps start $AppName --profile $Profile
+databricks apps deploy $AppName --profile $Profile `
   --source-code-path $SourcePath --auto-approve --timeout 20m
-databricks apps get scenario-data-factory --profile $Profile
+databricks apps get $AppName --profile $Profile
 ```
 
-The App has resource bindings for the model endpoint, generation job, MLflow experiment, control
-volume, and raw-data volume. Grant the App service principal access to the selected catalog if your
-workspace does not grant the required permissions automatically.
+The App resource bindings request access to the selected model endpoint, generation Job, MLflow
+experiment, and the two volumes. If the deployment succeeds but drafting or job submission is
+denied, an administrator must grant the deployed App service principal the requested permissions.
+
+## Deploy To Databricks
+
+For subsequent code updates, rerun the validate, bundle deploy, and App deploy commands from the
+first-time deployment section using the same `$Profile`, `$Catalog`, `$Schema`, `$Endpoint`, and
+`$AppName` values. The deployment updates the wheel, Jobs, volumes, and App configuration without
+requiring manual recreation of those resources.
 
 ### Install Command
 
-The repository also provides an installer that performs the standard dev deployment using the
-default catalog and schema:
+The repository also provides an installer for the same standard dev deployment. Supply the values
+for the teammate's workspace instead of relying on the sample defaults:
 
 ```powershell
-uv run sdf install <profile> --target dev --model-endpoint <model-serving-endpoint>
+uv run sdf install <profile> --target dev `
+  --catalog <existing-catalog> `
+  --schema scenario_data_factory `
+  --app-name scenario-data-factory-<team> `
+  --model-endpoint <model-serving-endpoint>
 ```
 
 Use `--engine-only` to deploy the jobs and storage resources without deploying the App.
@@ -214,6 +252,14 @@ Delta output is used for typed clean and dirty tables. Raw output represents phy
 conditions such as schema-varying files, malformed records, ordering, late batches, and replay.
 Each run produces a summary and manifest containing the issue ID, type, table, column, affected
 record key, batch, and details.
+
+Delta table names use `<scenario>_<entity>` for the clean baseline and
+`<scenario>_<entity>_dq` for the defect-injected version. For example, a Canadian banking
+scenario named `cbank` writes `cbank_customers` and `cbank_customers_dq`; run IDs, row counts,
+and hashes stay in the manifest rather than the table name.
+
+The agent supplies this compact scenario code as `dataset_code`; reviewed YAML/JSON specs can set
+`outputs.delta_namespace` directly.
 
 The scenario has canonical JSON and a SHA-256 spec hash. Issue selection derives from the scenario
 seed, scenario ID, issue ID, issue type, and record key so a reviewed spec can be reproduced.

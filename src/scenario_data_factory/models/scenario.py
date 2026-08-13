@@ -157,8 +157,11 @@ class OutputSpec(BaseModel):
     mode: OutputMode = OutputMode.BOTH
     catalog: str | None = None
     schema_name: str | None = None
-    clean_delta_prefix: str = "clean"
-    dirty_delta_prefix: str = "dirty"
+    delta_namespace: str | None = None
+    # These are appended after the business table name, not prepended to it.
+    # The defaults therefore produce <scenario>_<table> and <scenario>_<table>_dq.
+    clean_delta_prefix: str = ""
+    dirty_delta_prefix: str = "dq"
     control_volume: str = "sdf_control"
     raw_volume: str = "sdf_raw"
     local_root: str = "out"
@@ -166,11 +169,18 @@ class OutputSpec(BaseModel):
     raw_format: Literal["json", "csv"] = "json"
     manifest_detail: Literal["full", "summary"] = "full"
 
-    @field_validator("catalog", "schema_name", "clean_delta_prefix", "dirty_delta_prefix")
+    @field_validator("catalog", "schema_name", "delta_namespace")
     @classmethod
     def valid_delta_identifier(cls, value: str | None) -> str | None:
         if value is not None and not _UC_IDENTIFIER.fullmatch(value):
             raise ValueError("catalog, schema, and Delta prefixes must be valid identifiers")
+        return value
+
+    @field_validator("clean_delta_prefix", "dirty_delta_prefix")
+    @classmethod
+    def valid_delta_suffix(cls, value: str) -> str:
+        if value and not _UC_IDENTIFIER.fullmatch(value):
+            raise ValueError("Delta quality suffixes must be valid identifiers")
         return value
 
 

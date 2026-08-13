@@ -52,7 +52,7 @@ def run_generation(
                 spec.outputs.catalog,
                 spec.outputs.schema_name,
                 spec.outputs.dirty_delta_prefix,
-                namespace=spec.name,
+                namespace=spec.outputs.delta_namespace or spec.name,
             )
         if spec.outputs.include_clean or not has_issues:
             written["clean_delta_tables"] = write_delta_tables(
@@ -60,7 +60,7 @@ def run_generation(
                 spec.outputs.catalog,
                 spec.outputs.schema_name,
                 spec.outputs.clean_delta_prefix,
-                namespace=spec.name,
+                namespace=spec.outputs.delta_namespace or spec.name,
             )
     if spec.outputs.mode in {OutputMode.RAW, OutputMode.BOTH, "raw", "both"}:
         if has_issues:

@@ -23,7 +23,7 @@ resources:
             package_name: scenario_data_factory
             entry_point: sdf_preview
             parameters:
-              - /Volumes/${var.catalog}/${var.schema}/sdf_control/scenarios/current.yaml
+              - /Volumes/${var.catalog}/${resources.schemas.sdf_schema.name}/sdf_control/scenarios/current.yaml
           environment_key: default
       environments:
         - environment_key: default
@@ -36,9 +36,9 @@ resources:
       name: sdf-${bundle.target}-generate
       parameters:
         - name: scenario_path
-          default: /Volumes/${var.catalog}/${var.schema}/sdf_control/scenarios/current.yaml
+          default: /Volumes/${var.catalog}/${resources.schemas.sdf_schema.name}/sdf_control/scenarios/current.yaml
         - name: output_root
-          default: /Volumes/${var.catalog}/${var.schema}/sdf_raw/runs
+          default: /Volumes/${var.catalog}/${resources.schemas.sdf_schema.name}/sdf_raw/runs
       tasks:
         - task_key: generate
           python_wheel_task:

@@ -8,16 +8,18 @@ def write_delta_tables(
     dataframes: dict[str, Any],
     catalog: str,
     schema: str,
-    prefix: str,
+    quality_suffix: str,
     *,
     namespace: str | None = None,
 ) -> list[str]:
     written: list[str] = []
-    table_prefix = _safe_identifier(prefix)
-    if namespace:
-        table_prefix = f"{_safe_identifier(namespace)}_{table_prefix}"
     for table, df in dataframes.items():
-        full_name = f"`{catalog}`.`{schema}`.`{table_prefix}_{_safe_identifier(table)}`"
+        name_parts = [
+            *([_safe_identifier(namespace)] if namespace else []),
+            _safe_identifier(table),
+            *([_safe_identifier(quality_suffix)] if quality_suffix else []),
+        ]
+        full_name = f"`{catalog}`.`{schema}`.`{'_'.join(name_parts)}`"
         df.write.format("delta").mode("overwrite").option(
             "overwriteSchema", "true"
         ).saveAsTable(full_name)

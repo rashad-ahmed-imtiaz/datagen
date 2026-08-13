@@ -19,6 +19,7 @@ from scenario_data_factory.models.scenario import (
     IssueSpec,
     IssueType,
     OutputMode,
+    OutputSpec,
     RelationshipSpec,
     ScenarioSpec,
     TableSpec,
@@ -505,6 +506,7 @@ def _custom_spec_from_intent(intent: dict[str, Any], prompt: str) -> tuple[Scena
         timeline=timeline,
         tables=tables,
         relationships=relationships,
+        outputs=OutputSpec(delta_namespace=_dataset_code_from_intent(intent, name)),
         metadata=_metadata_from_intent(intent),
     )
     spec = _ensure_databricks_outputs(spec)
@@ -1938,6 +1940,14 @@ def _identifier(value: object, default: str) -> str:
     return identifier
 
 
+def _dataset_code_from_intent(intent: dict[str, Any], scenario_name: str) -> str:
+    """Use the agent's compact dataset code, with a stable readable-name fallback."""
+    raw_code = intent.get("dataset_code")
+    if raw_code:
+        return _identifier(raw_code, "scenario")[:32]
+    return _identifier(scenario_name, "scenario")[:32]
+
+
 def _default_pk_name(table_name: str) -> str:
     return f"{_singular(table_name)}_id"
 
@@ -2862,6 +2872,7 @@ Return this exact JSON shape:
 {
   "domain":"custom_schema",
   "name":"short descriptive name",
+  "dataset_code":"short_table_prefix",
   "seed":42,
   "locale":"en_CA",
   "timeline":{"start_date":"2025-01-01","batches":12,"frequency":"monthly"},
@@ -2910,6 +2921,9 @@ Examples of entity interpretation:
 Include:
 - domain: "custom_schema"
 - name
+- dataset_code: a concise lower_snake_case table prefix, 3-16 characters. Use a memorable
+  domain abbreviation such as "cbank" for Canadian banking or "retail" for retail sales;
+  never include row counts, run IDs, hashes, or quality markers.
 - locale when provided by the user
 - timeline when provided by the user, e.g.
   {"start_date":"2025-01-01","batches":12,"frequency":"monthly"}
@@ -3215,12 +3229,13 @@ file_replay, schema_drift, correlated_missingness.
 
 def _ensure_databricks_outputs(spec: ScenarioSpec) -> ScenarioSpec:
     data = spec.model_dump(mode="json")
+    catalog, schema = _workspace_output_location()
     data["outputs"].update(
         {
             "mode": OutputMode.BOTH.value,
             "include_clean": True,
-            "catalog": data["outputs"].get("catalog") or "sdf",
-            "schema_name": data["outputs"].get("schema_name") or "scenario_data_factory",
+            "catalog": data["outputs"].get("catalog") or catalog,
+            "schema_name": data["outputs"].get("schema_name") or schema,
         }
     )
     return ScenarioSpec.model_validate(data)
@@ -3288,4 +3303,22 @@ def _control_volume_root() -> str:
 
 
 def _raw_runs_root() -> str:
-    return os.getenv("SDF_RAW_RUNS_ROOT") or "/Volumes/sdf/scenario_data_factory/sdf_raw/runs"
+    configured_root = os.getenv("SDF_RAW_RUNS_ROOT")
+    if configured_root:
+        return configured_root
+    raw_volume = os.getenv("SDF_RAW_VOLUME")
+    if raw_volume:
+        return f"{raw_volume.rstrip('/')}/runs"
+    return "/Volumes/sdf/scenario_data_factory/sdf_raw/runs"
+
+
+def _workspace_output_location() -> tuple[str, str]:
+    """Resolve output storage from the bound control volume in any bundle target."""
+    root = os.getenv("SDF_CONTROL_VOLUME", "")
+    parts = root.strip("/").split("/")
+    if len(parts) >= 4 and parts[0] == "Volumes":
+        return parts[1], parts[2]
+    return (
+        os.getenv("SDF_CATALOG", "sdf"),
+        os.getenv("SDF_SCHEMA", "scenario_data_factory"),
+    )

@@ -35,10 +35,10 @@ resources:
         - name: control-volume
           uc_securable:
             securable_type: VOLUME
-            securable_full_name: ${var.catalog}.${var.schema}.sdf_control
+            securable_full_name: ${resources.schemas.sdf_schema.catalog_name}.${resources.schemas.sdf_schema.name}.sdf_control
             permission: WRITE_VOLUME
         - name: raw-volume
           uc_securable:
             securable_type: VOLUME
-            securable_full_name: ${var.catalog}.${var.schema}.sdf_raw
+            securable_full_name: ${resources.schemas.sdf_schema.catalog_name}.${resources.schemas.sdf_schema.name}.sdf_raw
             permission: WRITE_VOLUME
