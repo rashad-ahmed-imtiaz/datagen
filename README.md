@@ -144,6 +144,10 @@ databricks bundle deploy --profile $Profile --target dev `
   --var app_name=$AppName --var model_endpoint=$Endpoint
 ```
 
+The schema variable is literal: `$Schema = "scenario_data_factory_test"` creates
+`<catalog>.scenario_data_factory_test`. Development mode still isolates Jobs, experiments, and
+other workspace resources, but it does not prepend a username to the Unity Catalog schema.
+
 Then deploy the App using the source path returned by the bundle:
 
 ```powershell

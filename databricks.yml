@@ -1,6 +1,11 @@
 bundle:
   name: scenario-data-factory
 
+experimental:
+  # Keep the Unity Catalog schema name supplied through --var schema literal.
+  # Development mode still isolates Jobs, experiments, and other workspace resources.
+  skip_name_prefix_for_schema: true
+
 include:
   - resources/*.yml
 
