@@ -158,7 +158,7 @@ $SourcePath = $Summary.resources.apps.scenario_data_factory.source_code_path
 
 databricks apps start $AppName --profile $Profile
 databricks apps deploy $AppName --profile $Profile `
-  --source-code-path $SourcePath --auto-approve --timeout 20m
+  --source-code-path $SourcePath --timeout 20m
 databricks apps get $AppName --profile $Profile
 ```
 

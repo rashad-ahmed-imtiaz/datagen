@@ -221,7 +221,6 @@ def install(
                 profile,
                 "--source-code-path",
                 str(app_source_path),
-                "--auto-approve",
                 "--timeout",
                 "20m",
             ]
